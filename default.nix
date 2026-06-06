@@ -41,6 +41,7 @@ let
       || rel == "settings.gradle"
       || rel == "build.gradle"
       || rel == "bridge_mcp_ghidra.py"
+      || rel == "src"
       || rel == "debugger"
       || lib.hasPrefix "src/" rel
       || lib.hasPrefix "debugger/" rel;
