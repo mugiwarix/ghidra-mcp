@@ -6,19 +6,23 @@
     <groupId>com.xebyte</groupId>
     <artifactId>GhidraMCP</artifactId>
     <packaging>jar</packaging>
-    <version>5.12.0</version>
+    <version>7.0.0</version>
     <name>Ghidra MCP Server</name>
     <description>Production-ready Model Context Protocol server for Ghidra reverse engineering platform. Provides MCP-based tooling and automation for reverse engineering workflows: convention-enforcing rename/type/comment endpoints, batch operations, P-code emulation, live debugger integration, headless server, and Ghidra Server multi-version support.</description>
     <url>https://github.com/bethington/ghidra-mcp</url>
     <properties>
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <ghidra.version>12.1</ghidra.version>
+        <ghidra.version>12.1.2</ghidra.version>
         <!-- Build timestamp generated at compile time (format: yyyyMMdd-HHmmss) -->
         <build.timestamp>${maven.build.timestamp}</build.timestamp>
         <maven.build.timestamp.format>yyyyMMdd-HHmmss</maven.build.timestamp.format>
         <!-- Build number - use current time as unique identifier -->
         <build.number>${maven.build.timestamp}</build.number>
+        <!-- Default empty so surefire's @{argLine} resolves even when the
+             JaCoCo agent is skipped (jacoco.skip=true); prepare-agent
+             overwrites this property at runtime. -->
+        <argLine></argLine>
     </properties>
     <licenses>
         <license>
@@ -131,14 +135,32 @@
         <dependency>
             <groupId>org.mockito</groupId>
             <artifactId>mockito-core</artifactId>
-            <version>5.16.0</version>
+            <version>5.23.0</version>
             <scope>test</scope>
         </dependency>
-        <!-- Ghidra DB (test only) — needed so Mockito can instrument Program's type hierarchy -->
+        <!-- Ghidra DB (provided — bundled with Ghidra in Framework/DB/lib/).
+             Needed at compile time because HeadlessProgramProvider touches
+             DomainObjectAdapterDB, which indirectly references db.util.ErrorHandler,
+             and at test time so Mockito can instrument Program's type hierarchy.
+             Must NOT be test-scoped: the IDE (Eclipse JDT) then compiles main
+             sources with an incomplete classpath and writes error-carrying classes
+             into target/classes, which surface as bogus "Unresolved compilation
+             problem" errors on the next `mvn test` that skips recompilation. -->
         <dependency>
             <groupId>ghidra</groupId>
             <artifactId>DB</artifactId>
             <version>${ghidra.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- jdom2 (test only) — ghidra.framework.options.OptionType's static initializer
+             builds a CUSTOM_TYPE constant that reaches SaveState -> jdom2. Any offline
+             test that names an OptionType constant (e.g. the set_program_option type
+             tests) fails with NoClassDefFoundError without it. Same version Ghidra
+             ships in Framework/Generic/lib. -->
+        <dependency>
+            <groupId>org.jdom</groupId>
+            <artifactId>jdom2</artifactId>
+            <version>2.0.6.1</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -164,14 +186,39 @@
             </resource>
         </resources>
         <plugins>
-            <!-- Maven Surefire Plugin — enable Byte Buddy experimental mode for Java 25 -->
+            <!-- Maven Surefire Plugin — enable Byte Buddy experimental mode for Java 25.
+                 @{argLine} late-binds the JaCoCo agent injected by prepare-agent. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.6</version>
                 <configuration>
-                    <argLine>-Dnet.bytebuddy.experimental=true</argLine>
+                    <argLine>@{argLine} -Dnet.bytebuddy.experimental=true</argLine>
                 </configuration>
+            </plugin>
+            <!-- JaCoCo — line coverage for the offline test tier. Report lands in
+                 target/site/jacoco/ on every `mvn test`. Disable with
+                 -Djacoco.skip=true. The coverage GATE that consumes this data
+                 lives in the `coverage-gate` profile at the bottom of this file. -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.15</version>
+                <executions>
+                    <execution>
+                        <id>jacoco-prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
             <!-- Maven Compiler Plugin -->
             <plugin>
@@ -197,7 +244,7 @@
             <!-- Use custom MANIFEST.MF -->
             <plugin>
                 <artifactId>maven-jar-plugin</artifactId>
-                <version>3.5.0</version>
+                <version>3.5.1</version>
                 <configuration>
                     <archive>
                         <manifestFile>src/main/resources/META-INF/MANIFEST.MF</manifestFile>
@@ -256,7 +303,7 @@
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-jar-plugin</artifactId>
-                        <version>3.5.0</version>
+                        <version>3.5.1</version>
                         <configuration>
                             <archive>
                                 <manifest>
@@ -319,6 +366,59 @@
                                 <goals>
                                     <goal>build</goal>
                                 </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Coverage gate. Opt-in via -Pcoverage-gate; CI enables it on the
+             full offline run.
+
+             It is a RATCHET, not a target: the minimum sits just under the
+             measured offline-tier coverage so a regression fails the build
+             while ordinary work doesn't. Raise it as coverage improves; never
+             lower it to make a build pass. (Mirrors the Python cov-fail-under
+             floors in CI.)
+
+             The number is low because it measures the OFFLINE tier only — the
+             integration suites that exercise the services need a live Ghidra
+             on 8089 and don't run in CI.
+
+             It lives in a profile rather than the default build because the
+             rule is only meaningful for a FULL run: `mvn test -Dtest=OneClass`
+             legitimately covers a few percent of the codebase, and gating that
+             by default would fail every targeted local test run. -->
+        <profile>
+            <id>coverage-gate</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.jacoco</groupId>
+                        <artifactId>jacoco-maven-plugin</artifactId>
+                        <version>0.8.15</version>
+                        <executions>
+                            <execution>
+                                <id>jacoco-check</id>
+                                <phase>test</phase>
+                                <goals>
+                                    <goal>check</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <rule>
+                                            <element>BUNDLE</element>
+                                            <limits>
+                                                <limit>
+                                                    <counter>LINE</counter>
+                                                    <value>COVEREDRATIO</value>
+                                                    <minimum>0.075</minimum>
+                                                </limit>
+                                            </limits>
+                                        </rule>
+                                    </rules>
+                                </configuration>
                             </execution>
                         </executions>
                     </plugin>

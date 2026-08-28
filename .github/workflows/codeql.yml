@@ -5,7 +5,7 @@
 # Two languages because we ship both:
 #   * java-kotlin → covers src/main/java/com/xebyte/ (the GhidraMCP
 #     plugin + headless server, ~20K LOC)
-#   * python → covers bridge_mcp_ghidra.py + tools/setup/ + fun-doc/
+#   * python → covers python/bridge_mcp_ghidra/ + tools/setup/
 #
 # Build mode "none" for both: CodeQL extracts source directly. The
 # Java side compiles against Ghidra jars that aren't on Maven Central
@@ -18,9 +18,9 @@ name: CodeQL
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   schedule:
     # Weekly scan — separate from push-triggered runs so a quiet
     # repo still gets fresh analysis as rules update.
@@ -54,15 +54,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@03e4368ac7daa2bd82b3e85262f3bf87ee112f57  # v3
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3  # v4.37.6
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@03e4368ac7daa2bd82b3e85262f3bf87ee112f57  # v3
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3  # v4.37.6
         with:
           category: "/language:${{ matrix.language }}"

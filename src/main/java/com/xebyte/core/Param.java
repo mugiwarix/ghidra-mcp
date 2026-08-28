@@ -58,4 +58,40 @@ public @interface Param {
      * The bridge uses this to apply address sanitization before dispatch.
      */
     String paramType() default "";
+
+    /**
+     * Alternative names for this parameter. The canonical name ({@link #value()}) is advertised
+     * in /mcp/schema and should be preferred by new callers. At runtime, the parameter resolver
+     * accepts any alias listed here as an alternative spelling, enabling backward compatibility
+     * when standardizing inconsistent parameter names across endpoints.
+     *
+     * <p>Example: {@code @Param(value="function_address", aliases={"address"})}
+     * will accept both {@code function_address=} and {@code address=} in HTTP requests.
+     *
+     * <p>Resolution order:
+     * <ol>
+     *   <li>Canonical name ({@link #value()})</li>
+     *   <li>Aliases in declaration order</li>
+     *   <li>Default value (if defined) or null</li>
+     * </ol>
+     */
+    String[] aliases() default {};
+
+    /**
+     * Whether an empty string is a meaningful value for this parameter.
+     *
+     * <p>The MCP bridge drops {@code ""} arguments by default, because some
+     * clients send every schema default on every call and an empty selector
+     * would otherwise be treated as "present but blank" and rejected.
+     *
+     * <p>That default is wrong for parameters where empty <em>is</em> the
+     * intent — clearing a comment is the motivating case: {@code set_comment}
+     * with {@code comment: ""} means "remove it", but the argument was being
+     * dropped before it reached Java, so the tool answered "Comment text is
+     * required" and clearing was unreachable through MCP.
+     *
+     * <p>Set this to {@code true} only where empty carries meaning, and make
+     * sure the handler distinguishes empty from absent.
+     */
+    boolean allowEmpty() default false;
 }

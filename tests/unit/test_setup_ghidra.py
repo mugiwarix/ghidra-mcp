@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
+import tools.setup.ghidra as ghidra_setup
 
 from tools.setup.ghidra import (
     DEFAULT_MCP_URL,
     PLUGIN_CLASS,
     REQUIRED_GHIDRA_JARS,
+    _file_sha256,
+    _has_dependency_group,
     collect_preflight_issues,
+    install_ghidra_dependencies,
     find_plugin_archive,
     mark_extension_known_in_tool_config,
     patch_codebrowser_tcd,
@@ -23,8 +28,92 @@ from tools.setup.ghidra import (
     run_default_smoke_test,
     run_endpoint_catalog_test,
     run_selected_endpoint_contract_test,
+    start_ghidra,
 )
 from tools.setup.versioning import VersionInfo
+
+
+class _FakeCompleted:
+    def __init__(self, returncode: int = 0) -> None:
+        self.returncode = returncode
+
+
+class TestInstallGhidraDependenciesRefresh:
+    """`install_ghidra_dependencies` must refresh a cached jar whose content
+    drifted from the install's jar, not just skip on version-string presence.
+
+    Regression: a stale test-scoped DB.jar (a Ghidra re-release rebuilt the jar
+    under the same 12.1.2 version) stayed cached in m2, breaking the offline
+    Java suite until the cache was manually refreshed.
+    """
+
+    def _make_install(self, ghidra_path: Path, content: bytes = b"NEW") -> None:
+        for _artifact_id, relative_path in REQUIRED_GHIDRA_JARS:
+            jar = ghidra_path / relative_path
+            jar.parent.mkdir(parents=True, exist_ok=True)
+            jar.write_bytes(content + b" " + relative_path.encode())
+
+    def _cached_jar(self, home: Path, artifact_id: str, version: str) -> Path:
+        return (
+            home / ".m2" / "repository" / "ghidra" / artifact_id / version
+            / f"{artifact_id}-{version}.jar"
+        )
+
+    def test_refreshes_stale_and_skips_identical(self, tmp_path, monkeypatch):
+        version = "12.1.2"
+        ghidra_path = tmp_path / "ghidra_12.1.2_PUBLIC"
+        home = tmp_path / "home"
+        self._make_install(ghidra_path)
+
+        # Pre-seed m2: one artifact identical to the install (should skip),
+        # one artifact stale (should refresh).
+        skip_id, skip_rel = REQUIRED_GHIDRA_JARS[0]
+        stale_id, _stale_rel = REQUIRED_GHIDRA_JARS[1]
+        identical = self._cached_jar(home, skip_id, version)
+        identical.parent.mkdir(parents=True, exist_ok=True)
+        identical.write_bytes((ghidra_path / skip_rel).read_bytes())  # byte-identical
+        stale = self._cached_jar(home, stale_id, version)
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"STALE OLD BUILD")
+
+        installed: list[str] = []
+
+        def fake_run(command, **kwargs):
+            for token in command:
+                if str(token).startswith("-DartifactId="):
+                    installed.append(str(token).split("=", 1)[1])
+            return _FakeCompleted(0)
+
+        monkeypatch.setattr("tools.setup.ghidra.find_maven_command", lambda: "mvn")
+        monkeypatch.setattr(
+            "tools.setup.ghidra.read_pom_versions",
+            lambda _root: VersionInfo(project_version="5.16.0", ghidra_version=version),
+        )
+        monkeypatch.setattr(
+            "tools.setup.ghidra.install_ghidratrace_for_debugger",
+            lambda *a, **k: 0,
+        )
+        monkeypatch.setattr("tools.setup.ghidra.subprocess.run", fake_run)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+        rc = install_ghidra_dependencies(tmp_path, ghidra_path)
+
+        assert rc == 0
+        # Identical cache skipped; stale cache refreshed.
+        assert skip_id not in installed, f"{skip_id} should have been skipped"
+        assert stale_id in installed, f"{stale_id} should have been refreshed"
+        # Every artifact with no cache at all is installed.
+        for artifact_id, _rel in REQUIRED_GHIDRA_JARS[2:]:
+            assert artifact_id in installed
+
+
+def test_file_sha256_matches_hashlib(tmp_path: Path):
+    import hashlib
+
+    blob = tmp_path / "x.jar"
+    payload = b"ghidra-jar-bytes" * 4096
+    blob.write_bytes(payload)
+    assert _file_sha256(blob) == hashlib.sha256(payload).hexdigest()
 
 
 def test_patch_frontend_tool_config_adds_plugin_to_self_closing_utility_block():
@@ -263,7 +352,50 @@ def test_collect_preflight_issues_reports_missing_jar_and_debugger_requirements(
     )
 
     assert any("Missing required Ghidra dependency" in issue for issue in issues)
-    assert any("Debugger requirements file not found" in issue for issue in issues)
+    assert any(
+        "Debugger dependency group not found" in issue for issue in issues
+    )
+
+
+class TestHasDependencyGroup:
+    def test_true_for_real_entry(self, tmp_path: Path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[dependency-groups]\ndebugger = [\"pybag==2.2.16\"]\n",
+            encoding="utf-8",
+        )
+        assert _has_dependency_group(pyproject, "debugger") is True
+
+    def test_true_for_quoted_key(self, tmp_path: Path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[dependency-groups]\n\"debugger\" = [\"pybag\"]\n",
+            encoding="utf-8",
+        )
+        assert _has_dependency_group(pyproject, "debugger") is True
+
+    def test_false_when_word_only_in_comment(self, tmp_path: Path):
+        # The reviewer's false-positive case: "debugger" appears as prose but
+        # there is no resolvable dependency group, so uv sync would fail.
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "# TODO: add a debugger dependency group later\n"
+            "[dependency-groups]\ntest = [\"pytest\"]\n",
+            encoding="utf-8",
+        )
+        assert _has_dependency_group(pyproject, "debugger") is False
+
+    def test_false_when_key_in_other_section(self, tmp_path: Path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[tool.something]\ndebugger = true\n"
+            "[dependency-groups]\ntest = [\"pytest\"]\n",
+            encoding="utf-8",
+        )
+        assert _has_dependency_group(pyproject, "debugger") is False
+
+    def test_false_when_file_missing(self, tmp_path: Path):
+        assert _has_dependency_group(tmp_path / "nope.toml", "debugger") is False
 
 
 def _stub_version(
@@ -276,7 +408,7 @@ def _stub_version(
 
 
 class TestFindPluginArchive:
-    def test_prefers_gradle_output_over_maven(
+    def test_prefers_newest_exact_version_archive(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         _stub_version(monkeypatch, tmp_path)
@@ -286,8 +418,10 @@ class TestFindPluginArchive:
         maven_zip.parent.mkdir(parents=True)
         gradle_zip.write_bytes(b"gradle")
         maven_zip.write_bytes(b"maven")
+        os.utime(gradle_zip, (100, 100))
+        os.utime(maven_zip, (200, 200))
 
-        assert find_plugin_archive(tmp_path) == gradle_zip
+        assert find_plugin_archive(tmp_path) == maven_zip
 
     def test_falls_back_to_maven_target_when_gradle_absent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -319,6 +453,84 @@ class TestFindPluginArchive:
             find_plugin_archive(tmp_path)
 
 
+def test_start_ghidra_detaches_from_parent_session_on_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ghidra_path = tmp_path / "ghidra_12.1_PUBLIC"
+    ghidra_path.mkdir()
+    launcher = ghidra_path / "ghidraRun"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    recorded: dict = {}
+
+    monkeypatch.setattr(ghidra_setup.os, "name", "posix")
+    monkeypatch.setattr(
+        ghidra_setup.subprocess,
+        "Popen",
+        lambda command, **kwargs: recorded.update(
+            {"command": command, "kwargs": kwargs}
+        ),
+    )
+
+    # Pass repo_root so start_ghidra() doesn't fall back to Path.cwd(): with
+    # os.name monkeypatched to a non-"nt" value, pathlib.Path.cwd() would try to
+    # instantiate a PosixPath and raise on a Windows host. (Matches the Windows
+    # test below, which already passes repo_root.)
+    assert start_ghidra(ghidra_path, repo_root=tmp_path) == 0
+    assert recorded["command"] == [str(launcher)]
+    assert recorded["kwargs"]["start_new_session"] is True
+
+
+def test_start_ghidra_does_not_detach_on_non_posix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ghidra_path = tmp_path / "ghidra_12.1_PUBLIC"
+    ghidra_path.mkdir()
+    launcher = ghidra_path / "ghidraRun"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    recorded: dict = {}
+
+    monkeypatch.setattr(ghidra_setup.os, "name", "java")
+    monkeypatch.setattr(
+        ghidra_setup.subprocess,
+        "Popen",
+        lambda command, **kwargs: recorded.update(
+            {"command": command, "kwargs": kwargs}
+        ),
+    )
+
+    # Pass repo_root so start_ghidra() doesn't fall back to Path.cwd(): with
+    # os.name monkeypatched to a non-"nt" value, pathlib.Path.cwd() would try to
+    # instantiate a PosixPath and raise on a Windows host. (Matches the Windows
+    # test below, which already passes repo_root.)
+    assert start_ghidra(ghidra_path, repo_root=tmp_path) == 0
+    assert recorded["kwargs"]["start_new_session"] is False
+
+
+def test_start_ghidra_uses_batch_launcher_without_detaching_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ghidra_path = tmp_path / "ghidra_12.1_PUBLIC"
+    ghidra_path.mkdir()
+    launcher = ghidra_path / "ghidraRun.bat"
+    launcher.write_text("@echo off\n", encoding="utf-8")
+    recorded: dict = {}
+
+    monkeypatch.setattr(ghidra_setup.os, "name", "nt")
+    monkeypatch.setattr(ghidra_setup.sys, "platform", "win32")
+    monkeypatch.setenv("COMSPEC", "cmd-test.exe")
+    monkeypatch.setattr(
+        ghidra_setup.subprocess,
+        "Popen",
+        lambda command, **kwargs: recorded.update(
+            {"command": command, "kwargs": kwargs}
+        ),
+    )
+
+    assert start_ghidra(ghidra_path, repo_root=tmp_path) == 0
+    assert recorded["command"] == ["cmd-test.exe", "/c", str(launcher)]
+    assert recorded["kwargs"]["start_new_session"] is False
+
+
 def test_collect_preflight_issues_passes_with_required_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -330,8 +542,8 @@ def test_collect_preflight_issues_passes_with_required_files(
         jar_path.parent.mkdir(parents=True, exist_ok=True)
         jar_path.write_text("jar", encoding="utf-8")
 
-    (tmp_path / "requirements-debugger.txt").write_text(
-        "pybag==1.0\n", encoding="utf-8"
+    (tmp_path / "pyproject.toml").write_text(
+        "[dependency-groups]\ndebugger = [\"pybag==2.2.16\"]\n", encoding="utf-8"
     )
     user_base = tmp_path / "user-ghidra"
     (user_base / "ghidra_12.1_PUBLIC").mkdir(parents=True)
@@ -860,11 +1072,13 @@ def test_debugger_live_skipped_on_environmental_launch_failure(
 
     monkeypatch.setattr(ghidra, "_mcp_request", fake_mcp_request)
     monkeypatch.setattr(ghidra, "load_env_file", lambda _p: {})
-    # The function's `finally:` block calls _terminate_processes_by_name
-    # which spawns `taskkill` when os.name == "nt". On Linux CI that
-    # binary doesn't exist and the subprocess.run raises FileNotFoundError
-    # *out of the finally*, masking the test's actual outcome. Stub.
+    # The function's `finally:` block calls _terminate_dbgeng_launcher_processes
+    # and _terminate_processes_by_name, both of which spawn `powershell`/
+    # `taskkill` when os.name == "nt". On Linux CI those binaries don't exist
+    # and subprocess.run raises FileNotFoundError *out of the finally*,
+    # masking the test's actual outcome. Stub both.
     monkeypatch.setattr(ghidra, "_terminate_processes_by_name", lambda _name: None)
+    monkeypatch.setattr(ghidra, "_terminate_dbgeng_launcher_processes", lambda: None)
 
     with pytest.raises(ghidra.DebuggerLiveTestSkipped, match="Debugger backend unavailable"):
         ghidra.run_debugger_live_test(tmp_path, "http://127.0.0.1:8089")
@@ -888,10 +1102,153 @@ def test_debugger_live_raises_runtime_error_on_real_failure(
     monkeypatch.setattr(ghidra, "_mcp_request", fake_mcp_request)
     monkeypatch.setattr(ghidra, "load_env_file", lambda _p: {})
     monkeypatch.setattr(ghidra, "_terminate_processes_by_name", lambda _name: None)
+    monkeypatch.setattr(ghidra, "_terminate_dbgeng_launcher_processes", lambda: None)
 
     # Real test failure must NOT be swallowed as a skip.
     with pytest.raises(RuntimeError, match="Unexpected internal state"):
         ghidra.run_debugger_live_test(tmp_path, "http://127.0.0.1:8089")
+
+
+# ---------------------------------------------------------------------------
+# _terminate_dbgeng_launcher_processes — releases dbgeng's grip on a stuck
+# debuggee by killing the local-dbgeng launcher backend instead of the
+# (un-taskkill-able) debuggee itself. See project memory for the live
+# incident this closes: a stuck BenchmarkDebug.exe locked Benchmark.dll and
+# broke reset_benchmark_fixture's /delete_file with "file is in use".
+# ---------------------------------------------------------------------------
+
+
+def test_terminate_dbgeng_launcher_processes_noop_on_non_windows(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from tools.setup import ghidra
+
+    monkeypatch.setattr(ghidra.os, "name", "posix")
+
+    def fail_if_called(*_a, **_kw):
+        raise AssertionError("subprocess.run must not run on non-Windows")
+
+    monkeypatch.setattr(ghidra.subprocess, "run", fail_if_called)
+    ghidra._terminate_dbgeng_launcher_processes()  # must not raise
+
+
+def test_terminate_dbgeng_launcher_processes_kills_matched_pids(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from tools.setup import ghidra
+
+    monkeypatch.setattr(ghidra.os, "name", "nt")
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = "111\n222\n"
+
+    monkeypatch.setattr(ghidra.subprocess, "run", lambda *a, **kw: FakeCompleted())
+    killed: list[int] = []
+    monkeypatch.setattr(ghidra, "_terminate_process", lambda pid: killed.append(pid))
+
+    ghidra._terminate_dbgeng_launcher_processes()
+    assert killed == [111, 222]
+
+
+def test_terminate_dbgeng_launcher_processes_no_match_kills_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from tools.setup import ghidra
+
+    monkeypatch.setattr(ghidra.os, "name", "nt")
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = ""
+
+    monkeypatch.setattr(ghidra.subprocess, "run", lambda *a, **kw: FakeCompleted())
+
+    def fail_if_called(pid):
+        raise AssertionError("no PID should be terminated when nothing matched")
+
+    monkeypatch.setattr(ghidra, "_terminate_process", fail_if_called)
+    ghidra._terminate_dbgeng_launcher_processes()  # must not raise
+
+
+def test_debugger_live_test_kills_launcher_backend_before_debuggee(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The finally block must release dbgeng's grip on the launcher side
+    before (not instead of) the existing by-name kill of the debuggee --
+    confirmed live that resume-then-terminate-by-name alone can still leave
+    a stuck, un-taskkill-able BenchmarkDebug.exe behind."""
+    from tools.setup import ghidra
+
+    monkeypatch.setattr(ghidra.os, "name", "nt")
+    benchmark_path = tmp_path / ghidra.DEFAULT_BENCHMARK_DEBUG_EXE
+    benchmark_path.parent.mkdir(parents=True, exist_ok=True)
+    benchmark_path.write_bytes(b"")
+
+    def fake_mcp_request(repo_root, mcp_url, path, **kwargs):
+        return 200, {"error": "Unexpected internal state in trace handler"}
+
+    monkeypatch.setattr(ghidra, "_mcp_request", fake_mcp_request)
+    monkeypatch.setattr(ghidra, "load_env_file", lambda _p: {})
+
+    call_order: list[str] = []
+    monkeypatch.setattr(
+        ghidra, "_terminate_dbgeng_launcher_processes",
+        lambda: call_order.append("launcher"),
+    )
+    monkeypatch.setattr(
+        ghidra, "_terminate_processes_by_name",
+        lambda _name: call_order.append("debuggee"),
+    )
+
+    with pytest.raises(RuntimeError):
+        ghidra.run_debugger_live_test(tmp_path, "http://127.0.0.1:8089")
+
+    assert call_order == ["launcher", "debuggee"]
+
+
+def test_reset_benchmark_fixture_kills_launcher_before_debuggee_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """reset_benchmark_fixture's own pre-cleanup must release the launcher
+    backend before the by-name kill, for the same reason as the debugger
+    live test's finally block -- otherwise a stuck debug session from a
+    prior run leaves Benchmark.dll locked and /delete_file fails with
+    "file is in use", exactly as observed live."""
+    from tools.setup import ghidra
+
+    monkeypatch.setattr(ghidra.os, "name", "nt")
+    # Fresh tmp_path with the binaries already present so the build-fixture
+    # branch is skipped.
+    benchmark_dll = tmp_path / ghidra.DEFAULT_BENCHMARK_DLL
+    benchmark_debug_exe = tmp_path / ghidra.DEFAULT_BENCHMARK_DEBUG_EXE
+    benchmark_dll.parent.mkdir(parents=True, exist_ok=True)
+    benchmark_dll.write_bytes(b"")
+    benchmark_debug_exe.parent.mkdir(parents=True, exist_ok=True)
+    benchmark_debug_exe.write_bytes(b"")
+
+    call_order: list[str] = []
+    monkeypatch.setattr(
+        ghidra, "_terminate_dbgeng_launcher_processes",
+        lambda: call_order.append("launcher"),
+    )
+    monkeypatch.setattr(
+        ghidra, "_terminate_processes_by_name",
+        lambda _name: call_order.append("debuggee"),
+    )
+
+    class _StopHere(Exception):
+        pass
+
+    def fail_after_cleanup(*_a, **_kw):
+        raise _StopHere("stop right after the pre-cleanup calls under test")
+
+    monkeypatch.setattr(ghidra, "_close_and_delete_project_file", fail_after_cleanup)
+
+    with pytest.raises(_StopHere):
+        ghidra.reset_benchmark_fixture(tmp_path, "http://127.0.0.1:8089")
+
+    assert call_order == ["launcher", "debuggee"]
 
 
 # ---------------------------------------------------------------------------

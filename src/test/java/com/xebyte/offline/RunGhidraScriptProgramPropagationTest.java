@@ -79,19 +79,19 @@ public class RunGhidraScriptProgramPropagationTest extends TestCase {
         String src = readSource();
         String body = extractAnnotatedMethodBody(src, "/run_ghidra_script");
 
-        // The 3-arg runGhidraScript call must be present and must include
-        // programName. We require the literal `programName` token because
+        // The 4-arg runGhidraScript call must be present and must include
+        // programName plus timeoutSeconds. We require the literal `programName` token because
         // the @Param is named that way and it's the parameter the operator
         // actually controls.
-        Pattern threeArgCall = Pattern.compile(
-                "runGhidraScript\\s*\\(\\s*[^,]+,\\s*[^,]+,\\s*programName\\s*\\)",
+        Pattern timeoutAwareCall = Pattern.compile(
+                "runGhidraScript\\s*\\(\\s*[^,]+,\\s*[^,]+,\\s*programName\\s*,\\s*timeoutSeconds\\s*\\)",
                 Pattern.MULTILINE | Pattern.DOTALL);
         assertTrue(
-                "runGhidraScriptWithCapture must call the 3-arg runGhidraScript "
-                        + "and pass `programName` as the third argument — without it, "
+                "runGhidraScriptWithCapture must call the timeout-aware runGhidraScript "
+                        + "and pass `programName` plus `timeoutSeconds` — without it, "
                         + "the script executes against the session currentProgram "
                         + "instead of the operator's requested program.",
-                threeArgCall.matcher(body).find());
+                timeoutAwareCall.matcher(body).find());
     }
 
     public void testRunGhidraScriptWithCaptureDoesNotCallTwoArgOverload() throws IOException {
@@ -139,5 +139,45 @@ public class RunGhidraScriptProgramPropagationTest extends TestCase {
                         + "and short-circuit on pe.hasError() before doing the script search.",
                 body.contains("getProgramOrError")
                         && body.contains("pe.hasError()"));
+    }
+
+    public void testRunGhidraScriptInitializesAndRefreshesHeadlessScriptBundleBeforeProviderLookup()
+            throws IOException {
+        String src = readSource();
+
+        assertTrue(
+                "ProgramScriptService needs an explicit headless script bundle "
+                        + "host initializer because the GUI Script Manager is not "
+                        + "present in the headless MCP sidecar.",
+                src.contains("ensureScriptBundleHostInitialized"));
+        assertTrue(
+                "The headless script bundle initializer must enable the final "
+                        + "script source directory after the script file exists; "
+                        + "otherwise Ghidra can retain a placeholder bundle and "
+                        + "JavaScriptProvider cannot find the OSGi bundle.",
+                src.contains(".enable(new generic.jar.ResourceFile(scriptDirectory))"));
+
+        int methodStart = src.indexOf("public Response runGhidraScript(\n"
+                + "            @Param(value = \"script_path\"");
+        assertTrue("Could not locate 3-arg runGhidraScript method", methodStart >= 0);
+
+        int initCall = src.indexOf("ensureScriptBundleHostInitialized("
+                + "scriptFileForExecution.getParentFile())", methodStart);
+        int copyWarning = src.indexOf("Warning: Could not copy script to ~/ghidra_scripts/", methodStart);
+        int initError = src.indexOf("ERROR: Could not initialize Ghidra script bundle host for:", methodStart);
+        int providerLookup = src.indexOf("GhidraScriptUtil.getProvider", methodStart);
+
+        assertTrue(
+                "runGhidraScript must initialize and refresh GhidraScriptUtil's "
+                        + "BundleHost for the final script directory before "
+                        + "resolving JavaScriptProvider; otherwise headless Java "
+                        + "scripts fail before execution.",
+                initCall >= 0 && providerLookup >= 0 && initCall < providerLookup);
+        assertTrue(
+                "Script bundle initialization failures must have their own "
+                        + "diagnostic instead of being mislabeled as copy "
+                        + "warnings.",
+                copyWarning >= 0 && initError >= 0 && copyWarning < initCall
+                        && initCall < initError && initError < providerLookup);
     }
 }

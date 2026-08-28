@@ -15,6 +15,7 @@
  */
 package com.xebyte.core;
 
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.services.ProgramManager;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.DomainFolder;
@@ -44,9 +45,182 @@ public class FrontEndProgramProvider implements ProgramProvider {
     private final PluginTool tool;
     private final Map<String, Program> openPrograms = new ConcurrentHashMap<>();
     private final Map<String, String> pathToName = new ConcurrentHashMap<>(); // project path -> cache key
+    // Per-cache-key last-access time (System.nanoTime). Drives LRU eviction so the
+    // on-demand program cache stays bounded — without a cap it accumulated a consumer
+    // reference per distinct program and, when a long run documented dozens of DLLs,
+    // held them all in memory until Ghidra ran out and dropped offline for hours.
+    private final Map<String, Long> lastAccessNanos = new ConcurrentHashMap<>();
     private volatile Program currentProgram;
     private final TaskMonitor monitor;
     private final Object consumer; // DomainObject consumer for release tracking
+
+    /**
+     * Max on-demand programs held open at once. Above this, the least-recently-accessed
+     * cached program is released (the actively-used program stays recent and is never the
+     * victim). CodeBrowser-open programs are resolved before the cache and never counted
+     * here. Tunable via GHIDRA_MCP_MAX_CACHED_PROGRAMS; ~5-8 is safe (20+ crashes Ghidra).
+     */
+    private static final int MAX_CACHED_PROGRAMS = resolveMaxCachedPrograms();
+
+    private static int resolveMaxCachedPrograms() {
+        String raw = System.getenv("GHIDRA_MCP_MAX_CACHED_PROGRAMS");
+        if (raw != null && !raw.isBlank()) {
+            try {
+                return Math.max(2, Integer.parseInt(raw.trim()));
+            } catch (NumberFormatException ignored) {
+                // fall through to default
+            }
+        }
+        return 8;
+    }
+
+    /** Record an access so an in-use program stays out of the LRU eviction set. */
+    private void touch(String cacheKey) {
+        if (cacheKey != null) {
+            lastAccessNanos.put(cacheKey, System.nanoTime());
+        }
+    }
+
+    /**
+     * Pick the least-recently-accessed cache key whose Program is not protected, or null
+     * when nothing is evictable. Pure (no side effects) so it can be unit-tested offline.
+     */
+    public static String pickLruVictim(Map<String, Program> programs,
+                                       Map<String, Long> accessNanos,
+                                       java.util.Set<Program> protectedPrograms) {
+        String victim = null;
+        long oldest = Long.MAX_VALUE;
+        for (Map.Entry<String, Program> e : programs.entrySet()) {
+            if (protectedPrograms.contains(e.getValue())) {
+                continue;
+            }
+            long t = accessNanos.getOrDefault(e.getKey(), 0L);
+            if (t < oldest) {
+                oldest = t;
+                victim = e.getKey();
+            }
+        }
+        return victim;
+    }
+
+    /**
+     * Persist a cached program's unsaved changes BEFORE its consumer reference is
+     * released. On-demand-opened programs are mutated in memory by the write
+     * endpoints (add_function_tag, apply_data_type, …) but those endpoints never
+     * save. If such a program is then LRU-evicted (or released on dispose) while
+     * the provider holds the only reference, Ghidra disposes the object and the
+     * unsaved writes are silently lost — even though the endpoint returned
+     * success. Saving here makes the cache write-through so eviction can never
+     * discard committed work.
+     *
+     * Best-effort: on a save failure we log loudly but still proceed to release,
+     * because holding the reference indefinitely risks the out-of-memory crash the
+     * cache cap exists to prevent. Read-only opens (canSave()==false) and clean
+     * programs (isChanged()==false) are skipped.
+     */
+    private void saveBeforeRelease(String key, Program p) {
+        if (p == null || p.isClosed()) {
+            return;
+        }
+        try {
+            if (p.isChanged() && p.canSave()) {
+                ghidra.framework.model.DomainFile df = p.getDomainFile();
+                if (df != null) {
+                    // AutoAnalysisManager schedules its own background "Auto
+                    // Analysis" task via a DomainObjectListener whenever the
+                    // program changes, independent of anything this class
+                    // calls. If that task's transaction is still open when
+                    // save() runs, save() throws IOException ("Unable to
+                    // lock due to active transaction") -- confirmed in
+                    // Ghidra's own log, unrelated to any explicit analysis
+                    // call. Waiting narrows the window but Ghidra logs the
+                    // task-complete event and this kind of lock failure in
+                    // the same instant, so the completion notification and
+                    // the task's own transaction teardown aren't perfectly
+                    // synchronized -- a short backoff-and-retry on that
+                    // specific message closes the remaining gap.
+                    final int maxAttempts = 4;
+                    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+                        try {
+                            // GUARDED. waitForAnalysis(null, ...) can re-enter
+                            // itself via scheduleWorker -> analysisWorkerCallback
+                            // -> applyTo -> scheduleWorker, with nothing bounding
+                            // the loop. Measured 2026-08-11: all three
+                            // GhidraMCP-HTTP threads stuck 317 frames deep,
+                            // ~9,400 CPU-seconds each, server unrecoverable
+                            // without a restart. A thread already inside a wait
+                            // does not need a second one.
+                            if (!Boolean.TRUE.equals(ProgramScriptService.IN_ANALYSIS_WAIT.get())) {
+                                ProgramScriptService.IN_ANALYSIS_WAIT.set(Boolean.TRUE);
+                                try {
+                                    AutoAnalysisManager.getAnalysisManager(p)
+                                            .waitForAnalysis(null, monitor);
+                                } finally {
+                                    ProgramScriptService.IN_ANALYSIS_WAIT.set(Boolean.FALSE);
+                                }
+                            }
+                        } catch (Exception ignored) {
+                            // Best-effort: fall through and let save() surface any real failure.
+                        }
+                        try {
+                            df.save(monitor);
+                            break;
+                        } catch (java.io.IOException e) {
+                            String msg = e.getMessage();
+                            boolean isLockRace = msg != null && msg.contains("Unable to lock due to active transaction");
+                            if (!isLockRace || attempt == maxAttempts) {
+                                throw e;
+                            }
+                            Msg.warn(this, "Save raced Ghidra's own auto-analysis transaction (attempt "
+                                    + attempt + "/" + maxAttempts + "), retrying: " + msg);
+                            Thread.sleep(150L * attempt);
+                        }
+                    }
+                    Msg.info(this, "Saved modified program before release: " + key);
+                }
+            }
+        } catch (Exception ex) {
+            Msg.error(this, "FAILED to save modified program before release; changes "
+                    + "may be lost: " + key + " — " + ex.getMessage(), ex);
+        }
+    }
+
+    /**
+     * Release least-recently-accessed cached programs until the cache is at or below
+     * {@link #MAX_CACHED_PROGRAMS}. Never evicts the just-opened program or the current
+     * program. Releasing our consumer reference frees the program's memory when no
+     * CodeBrowser holds it (the common dashboard case); if a CodeBrowser does, the release
+     * is a harmless ref-count decrement. Unsaved changes are flushed first via
+     * {@link #saveBeforeRelease} so eviction can't discard committed writes.
+     */
+    private void evictExcessPrograms(Program justOpened) {
+        java.util.Set<Program> protectedPrograms = new java.util.HashSet<>();
+        if (justOpened != null) protectedPrograms.add(justOpened);
+        Program cur = currentProgram;
+        if (cur != null) protectedPrograms.add(cur);
+
+        while (openPrograms.size() > MAX_CACHED_PROGRAMS) {
+            String victimKey = pickLruVictim(openPrograms, lastAccessNanos, protectedPrograms);
+            if (victimKey == null) {
+                break; // everything left is protected
+            }
+            Program victim = openPrograms.remove(victimKey);
+            lastAccessNanos.remove(victimKey);
+            pathToName.values().removeIf(v -> v.equals(victimKey));
+            if (victim == null) {
+                continue;
+            }
+            try {
+                saveBeforeRelease(victimKey, victim);
+                victim.release(consumer);
+                Msg.info(this, "Evicted idle cached program (cap " + MAX_CACHED_PROGRAMS
+                        + ", " + openPrograms.size() + " remain): " + victimKey);
+            } catch (Exception ex) {
+                Msg.warn(this, "Error releasing evicted program " + victimKey + ": "
+                        + ex.getMessage());
+            }
+        }
+    }
 
     /**
      * Create a FrontEndProgramProvider for the given tool.
@@ -151,6 +325,7 @@ public class FrontEndProgramProvider implements ProgramProvider {
             if (cacheKey != null) {
                 Program cached = openPrograms.get(cacheKey);
                 if (cached != null && !cached.isClosed()) {
+                    touch(cacheKey);
                     return cached;
                 }
             }
@@ -160,6 +335,7 @@ public class FrontEndProgramProvider implements ProgramProvider {
         if (!searchName.startsWith("/")) {
             Program cached = openPrograms.get(searchName);
             if (cached != null && !cached.isClosed()) {
+                touch(searchName);
                 return cached;
             }
             // Case-insensitive cache lookup
@@ -167,6 +343,7 @@ public class FrontEndProgramProvider implements ProgramProvider {
                 if (entry.getKey().equalsIgnoreCase(searchName)) {
                     Program p = entry.getValue();
                     if (p != null && !p.isClosed()) {
+                        touch(entry.getKey());
                         return p;
                     }
                 }
@@ -295,6 +472,7 @@ public class FrontEndProgramProvider implements ProgramProvider {
             Program previousProgram = openPrograms.get(cacheKey);
             if (previousProgram != null && previousProgram != program) {
                 try {
+                    saveBeforeRelease(cacheKey, previousProgram);
                     previousProgram.release(consumer);
                     Msg.info(this, "Released previous cached program for: " + cacheKey);
                 } catch (Exception ex) {
@@ -311,6 +489,8 @@ public class FrontEndProgramProvider implements ProgramProvider {
             if (currentProgram == null) {
                 currentProgram = program;
             }
+            touch(cacheKey);
+            evictExcessPrograms(program);
             Msg.info(this, "Opened program from project: " + program.getName() +
                 " (" + projectPath + ")");
             return program;
@@ -324,6 +504,7 @@ public class FrontEndProgramProvider implements ProgramProvider {
                 Program previousProgram = openPrograms.get(cacheKey);
                 if (previousProgram != null && previousProgram != program) {
                     try {
+                        saveBeforeRelease(cacheKey, previousProgram);
                         previousProgram.release(consumer);
                     } catch (Exception ex) {
                         Msg.warn(this, "Error releasing previous program " + cacheKey + ": " + ex.getMessage());
@@ -338,6 +519,8 @@ public class FrontEndProgramProvider implements ProgramProvider {
                 if (currentProgram == null) {
                     currentProgram = program;
                 }
+                touch(cacheKey);
+                evictExcessPrograms(program);
                 Msg.info(this, "Opened program read-only: " + program.getName());
                 return program;
             } catch (Exception e2) {
@@ -419,6 +602,7 @@ public class FrontEndProgramProvider implements ProgramProvider {
         for (Map.Entry<String, Program> entry : openPrograms.entrySet()) {
             try {
                 Program program = entry.getValue();
+                saveBeforeRelease(entry.getKey(), program);
                 program.release(consumer);
                 Msg.info(this, "Released program: " + entry.getKey());
             } catch (Exception e) {
@@ -427,6 +611,7 @@ public class FrontEndProgramProvider implements ProgramProvider {
         }
         openPrograms.clear();
         pathToName.clear();
+        lastAccessNanos.clear();
         currentProgram = null;
     }
 
@@ -461,10 +646,12 @@ public class FrontEndProgramProvider implements ProgramProvider {
         boolean released = false;
         for (String key : new ArrayList<>(keys)) {
             Program program = openPrograms.remove(key);
+            lastAccessNanos.remove(key);
             if (program == null) {
                 continue;
             }
             try {
+                saveBeforeRelease(key, program);
                 program.release(consumer);
                 released = true;
                 if (program == currentProgram) {

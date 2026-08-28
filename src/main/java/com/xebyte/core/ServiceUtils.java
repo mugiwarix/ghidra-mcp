@@ -1,5 +1,7 @@
 package com.xebyte.core;
 
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileOptions;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.data.*;
@@ -228,8 +230,59 @@ public final class ServiceUtils {
     // ========================================================================
 
     /**
-     * Convert a list of strings into a newline-delimited string, applying offset and limit.
+     * Build the standard list-shaped response envelope.
+     *
+     * <p>Per {@code docs/project-management/MCP_RESPONSE_CONTRACT.md}, every
+     * collection-returning tool emits a named plural key plus paging metadata:
+     *
+     * <pre>{@code {"segments": [...], "count": 7, "offset": 0, "limit": 100, "total": 7}}</pre>
+     *
+     * <p>{@code total} is the point of the envelope. A bare array cannot tell a
+     * caller whether it received everything or the first page of 5,739, and
+     * {@code len(items)} cannot either.
+     *
+     * @param key   plural name for the collection ("segments", "functions")
+     * @param all   the full result set, before paging
+     * @param offset first item to return
+     * @param limit  maximum items to return; {@code <= 0} means "no limit"
      */
+    public static Response paged(String key, List<?> all, int offset, int limit) {
+        int start = Math.max(0, offset);
+        int end = (limit > 0) ? Math.min(all.size(), start + limit) : all.size();
+        List<?> page = (start >= all.size()) ? List.of() : all.subList(start, end);
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put(key, page);
+        out.put("count", page.size());
+        out.put("offset", start);
+        if (limit > 0) {
+            out.put("limit", limit);
+        }
+        out.put("total", all.size());
+        return Response.ok(out);
+    }
+
+    /**
+     * List envelope for tools that do not paginate.
+     *
+     * <pre>{@code {"entry_points": [...], "count": 12}}</pre>
+     */
+    public static Response listed(String key, List<?> all) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put(key, all);
+        out.put("count", all.size());
+        return Response.ok(out);
+    }
+
+    /**
+     * Convert a list of strings into a newline-delimited string, applying offset and limit.
+     *
+     * @deprecated Produces plain text, which violates the response contract
+     *     (see {@code docs/project-management/MCP_RESPONSE_CONTRACT.md}). Use
+     *     {@link #paged(String, List, int, int)} instead. Retained only while
+     *     the staged text-to-JSON migration is in flight.
+     */
+    @Deprecated
     public static String paginateList(List<String> items, int offset, int limit) {
         int start = Math.max(0, offset);
         int end = Math.min(items.size(), offset + limit);
@@ -383,9 +436,13 @@ public final class ServiceUtils {
      * @param size The byte size for masking (1, 2, 4, or 8)
      * @return Formatted string with all representations, or an error message
      */
-    public static String convertNumber(String text, int size) {
+    /**
+     * @throws IllegalArgumentException if {@code text} is null/empty or not parseable as a number
+     *     in any supported base -- callers should catch and route to {@code Response.err(...)}.
+     */
+    public static Map<String, Object> convertNumberData(String text, int size) {
         if (text == null || text.isEmpty()) {
-            return "Error: No number provided";
+            throw new IllegalArgumentException("No number provided");
         }
 
         try {
@@ -407,15 +464,15 @@ public final class ServiceUtils {
                 inputType = "decimal";
             }
 
-            StringBuilder result = new StringBuilder();
-            result.append("Input: ").append(text).append(" (").append(inputType).append(")\n");
-            result.append("Size: ").append(size).append(" bytes\n\n");
-
             // Handle different sizes with proper masking
             long mask = (size == 8) ? -1L : (1L << (size * 8)) - 1L;
             long maskedValue = value & mask;
 
-            result.append("Decimal (unsigned): ").append(Long.toUnsignedString(maskedValue)).append("\n");
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("input", text);
+            out.put("input_type", inputType);
+            out.put("size", size);
+            out.put("decimal_unsigned", Long.toUnsignedString(maskedValue));
 
             // Signed representation for appropriate sizes
             if (size <= 8) {
@@ -427,23 +484,20 @@ public final class ServiceUtils {
                         signedValue = maskedValue | (~mask);
                     }
                 }
-                result.append("Decimal (signed): ").append(signedValue).append("\n");
+                out.put("decimal_signed", Long.toString(signedValue));
             }
 
-            result.append("Hexadecimal: 0x").append(Long.toHexString(maskedValue).toUpperCase()).append("\n");
-            result.append("Binary: 0b").append(Long.toBinaryString(maskedValue)).append("\n");
-            result.append("Octal: 0").append(Long.toOctalString(maskedValue)).append("\n");
+            out.put("hexadecimal", "0x" + Long.toHexString(maskedValue).toUpperCase());
+            out.put("binary", "0b" + Long.toBinaryString(maskedValue));
+            out.put("octal", "0" + Long.toOctalString(maskedValue));
 
             // Add size-specific hex representation
             String hexFormat = String.format("%%0%dX", size * 2);
-            result.append("Hex (").append(size).append(" bytes): 0x").append(String.format(hexFormat, maskedValue)).append("\n");
+            out.put("hex_padded", "0x" + String.format(hexFormat, maskedValue));
 
-            return result.toString();
-
+            return out;
         } catch (NumberFormatException e) {
-            return "Error: Invalid number format: " + text;
-        } catch (Exception e) {
-            return "Error converting number: " + e.getMessage();
+            throw new IllegalArgumentException("Invalid number format: " + text, e);
         }
     }
 
@@ -501,6 +555,39 @@ public final class ServiceUtils {
         }
 
         return null;
+    }
+
+    // ========================================================================
+    // Decompiler
+    // ========================================================================
+
+    /**
+     * Create a {@link DecompInterface} configured to match the Ghidra GUI /
+     * analysis decompiler. Applies the program's saved {@link DecompileOptions}
+     * via {@link DecompileOptions#grabFromProgram(Program)} — most importantly
+     * the "Respect Read-Only Flags" option — so that PIC/GOT- and
+     * relocation-indirected accesses fold to their named globals instead of
+     * rendering as opaque {@code DAT_} constants.
+     *
+     * <p>A bare {@code new DecompInterface()} leaves "Respect Read-Only Flags"
+     * at the C++ decompiler-core default (OFF), which makes a read-only GOT slot
+     * stay an opaque {@code DAT_} rather than being propagated and folded to the
+     * symbol it points at. {@code grabFromProgram} restores the GUI-faithful
+     * behavior while still respecting any per-program override.
+     *
+     * <p>{@code setOptions} is applied <em>before</em> {@code openProgram}, per
+     * Ghidra's decompiler contract. The returned interface is already opened on
+     * {@code program}; the caller owns its lifecycle and must call
+     * {@link DecompInterface#dispose()} when finished.
+     */
+    public static DecompInterface createConfiguredDecompiler(Program program) {
+        DecompInterface decomp = new DecompInterface();
+        DecompileOptions opts = new DecompileOptions();
+        opts.grabFromProgram(program);              // GUI-faithful; respects per-program setting
+        decomp.setOptions(opts);
+        decomp.setSimplificationStyle("decompile"); // default style; explicit for consistency
+        decomp.openProgram(program);                // openProgram AFTER setOptions
+        return decomp;
     }
 
     // ========================================================================
@@ -575,7 +662,8 @@ public final class ServiceUtils {
 
     /**
      * Parse an address string using the program's AddressFactory.
-     * Accepts both plain hex (e.g., "0x1000") and segment:offset (e.g., "mem:1000", "code:ff00").
+     * Accepts both plain hex (e.g., "0x1000") and segment:offset (e.g., "mem:1000", "code:ff00",
+     * "EXTERNAL:00000012").
      *
      * Returns null on failure and sets the thread-local error message (read via getLastParseError()).
      *
@@ -608,34 +696,79 @@ public final class ServiceUtils {
             return null;
         }
 
+        // Detect a delimited multi-address string, e.g. "10020295;100202af;..." — another
+        // shape workers send when they meant to use the batch-comments inner lists. The plain
+        // "could not be resolved... try <space>:<hex>" message used to suggest prepending the
+        // space name to the WHOLE string, and the retry ("ram:..;ram:..") then produced a
+        // second, self-contradictory "Unknown address space 'ram'. Available: ram" error.
+        // Fail fast with the same structured hint as the array case instead. (addressStr is
+        // already stripped, so any remaining whitespace is internal — i.e. list-shaped.)
+        boolean looksLikeList = addressStr.indexOf(';') >= 0
+                || addressStr.indexOf(',') >= 0
+                || addressStr.chars().anyMatch(Character::isWhitespace);
+        if (looksLikeList) {
+            lastParseError.set("Address must be a single location, not a list. "
+                    + "Got: " + (addressStr.length() > 80 ? addressStr.substring(0, 80) + "..." : addressStr) + ". "
+                    + "If you're calling batch_set_comments, the top-level `address` is the "
+                    + "function entry only; per-line addresses go inside the `decompiler_comments` "
+                    + "and `disassembly_comments` arrays as objects like {\"address\": \"0x...\", \"comment\": \"...\"}. "
+                    + "If you're addressing a single location, pass one hex string like \"0x6ff6a4a0\".");
+            return null;
+        }
+
         // Detect if this is a segment:offset form for better error messages
         boolean hasColon = addressStr.contains(":");
 
-        // Normalize space:offset form: AddressFactory is case-sensitive and rejects "0x" prefix.
-        // Lowercase the space name and strip leading "0x"/"0X" from the offset so that inputs
-        // like "MEM:0x1000", "MEM:1000", and "Code:FF00" all resolve correctly — including
-        // addresses carried inside batch/container params that bypass bridge sanitization.
+        // Build a resolution candidate. AddressFactory rejects a "0x" prefix on the
+        // OFFSET, so strip it from the part after the last colon. The SPACE NAME is
+        // left untouched — overlay space names (e.g. "cli.Initial") are case-sensitive
+        // and Ghidra accepts both ':' and '::' separators.
+        String candidate = addressStr;
         if (hasColon) {
-            int colonIdx = addressStr.indexOf(':');
-            String spaceName = addressStr.substring(0, colonIdx).toLowerCase();
-            String offset = addressStr.substring(colonIdx + 1);
+            int lastColon = addressStr.lastIndexOf(':');
+            String prefix = addressStr.substring(0, lastColon + 1); // includes ':' or trailing of '::'
+            String offset = addressStr.substring(lastColon + 1);
             if (offset.startsWith("0x") || offset.startsWith("0X")) {
                 offset = offset.substring(2);
             }
-            addressStr = spaceName + ":" + offset;
+            candidate = prefix + offset;
         }
 
+        // 1) Exact-case attempt (handles overlays and correctly-cased physical spaces).
         try {
-            Address addr = program.getAddressFactory().getAddress(addressStr);
+            Address addr = program.getAddressFactory().getAddress(candidate);
             if (addr != null) return addr;
         } catch (Exception ignored) {}
 
-        // Build a rich error message listing available spaces
+        // 2) Case-insensitive space-name fallback. Preserves the forgiving behavior for
+        //    physical input like "MEM:0x1000" without blindly lowercasing (which would
+        //    break case-sensitive overlay names).
+        if (hasColon) {
+            int firstColon = candidate.indexOf(':');
+            String spaceName = candidate.substring(0, firstColon);
+            String offset = candidate.substring(candidate.lastIndexOf(':') + 1);
+            AddressSpace match = findSpaceIgnoreCase(program, spaceName);
+            if (match != null && !match.getName().equals(spaceName)) {
+                try {
+                    Address addr = program.getAddressFactory().getAddress(match.getName() + ":" + offset);
+                    if (addr != null) return addr;
+                } catch (Exception ignored) {}
+            }
+        }
+
+        // Build a rich error message listing available spaces (including overlays)
         String available = buildAvailableSpacesHint(program);
         if (hasColon) {
-            String spaceName = addressStr.substring(0, addressStr.indexOf(':'));
-            lastParseError.set("Unknown address space '" + spaceName + "' in '" + addressStr
-                + "'. Available spaces: " + available + ".");
+            String spaceName = candidate.substring(0, candidate.indexOf(':'));
+            String offsetPart = candidate.substring(candidate.lastIndexOf(':') + 1);
+            if (isKnownSpace(program, spaceName)) {
+                lastParseError.set("Could not resolve offset '" + offsetPart
+                    + "' in address space '" + spaceName + "'. Check that it is valid hex "
+                    + "within that space's range. Available spaces: " + available + ".");
+            } else {
+                lastParseError.set("Unknown address space '" + spaceName + "' in '" + addressStr
+                    + "'. Available spaces: " + available + ".");
+            }
         } else {
             lastParseError.set("Address '" + addressStr
                 + "' could not be resolved in the default address space. "
@@ -648,12 +781,18 @@ public final class ServiceUtils {
     /**
      * Return enriched address fields as a Map for JSON responses.
      * Always includes "address" (plain hex, no space prefix).
-     * Includes "address_full" and "address_space" only when the program has >1 physical space.
-     * If program is null, emits only the "address" field.
+     * Includes "address_full" and "address_space" when the address is in an overlay
+     * space (so it round-trips correctly) OR when the program has >1 physical space.
+     * If program is null and the address is non-overlay, emits only "address".
      */
     public static Map<String, Object> addressToJson(Address address, Program program) {
         String plainHex = address.toString(false);
-        if (program == null || getPhysicalSpaceCount(program) <= 1) {
+        boolean isOverlay = address.getAddressSpace().isOverlaySpace();
+        boolean isExternal = address.getAddressSpace().getType() == AddressSpace.TYPE_EXTERNAL;
+        // Overlay and external addresses must ALWAYS carry the qualifier: their bare hex
+        // can re-resolve to the wrong logical space. For non-overlay, non-external addresses
+        // keep the existing rule (qualify only when there is real physical ambiguity).
+        if (!isOverlay && !isExternal && (program == null || getPhysicalSpaceCount(program) <= 1)) {
             return JsonHelper.mapOf("address", plainHex);
         }
         String spaceName = address.getAddressSpace().getName();
@@ -682,27 +821,104 @@ public final class ServiceUtils {
         return count;
     }
 
+    /**
+     * Count the program's overlay address spaces (regardless of base type).
+     * Overlay addresses must be qualified with their space name; this is
+     * orthogonal to {@link #getPhysicalSpaceCount} (which measures physical
+     * ambiguity for plain hex addresses).
+     */
+    public static int getOverlaySpaceCount(Program program) {
+        int count = 0;
+        for (AddressSpace space : program.getAddressFactory().getAddressSpaces()) {
+            if (space.isOverlaySpace()) count++;
+        }
+        return count;
+    }
+
+    /**
+     * True if {@code spaceName} (case-insensitive) names a known address space in the
+     * program — a physical RAM/CODE space OR an overlay space (overlays carry their own
+     * types, e.g. TYPE_OTHER for ".shstrtab"). Used to distinguish a genuinely unknown
+     * space from a known space with a bad offset when building parse errors.
+     */
+    private static boolean isKnownSpace(Program program, String spaceName) {
+        return findSpaceIgnoreCase(program, spaceName) != null;
+    }
+
+    /**
+     * Find the address space whose name matches {@code spaceName} case-insensitively.
+     * Considers overlay spaces (any type) and physical RAM/CODE spaces. Returns null
+     * if none match. Used by parseAddress's case-insensitive fallback.
+     */
+    private static AddressSpace findSpaceIgnoreCase(Program program, String spaceName) {
+        if (spaceName == null || spaceName.isEmpty()) return null;
+        for (AddressSpace space : program.getAddressFactory().getAddressSpaces()) {
+            boolean eligible = space.isOverlaySpace()
+                    || space.getType() == AddressSpace.TYPE_RAM
+                    || space.getType() == AddressSpace.TYPE_CODE
+                    || space.getType() == AddressSpace.TYPE_EXTERNAL;
+            if (eligible && space.getName().equalsIgnoreCase(spaceName)) {
+                return space;
+            }
+        }
+        return null;
+    }
+
     private static String buildAvailableSpacesHint(Program program) {
+        StringBuilder physical = new StringBuilder();
+        StringBuilder external = new StringBuilder();
+        StringBuilder overlays = new StringBuilder();
+        for (AddressSpace space : program.getAddressFactory().getAddressSpaces()) {
+            if (space.isOverlaySpace()) {
+                if (overlays.length() > 0) overlays.append(", ");
+                overlays.append(space.getName());
+                continue;
+            }
+            int type = space.getType();
+            if (type == AddressSpace.TYPE_RAM || type == AddressSpace.TYPE_CODE) {
+                if (physical.length() > 0) physical.append(", ");
+                physical.append(space.getName());
+            } else if (type == AddressSpace.TYPE_EXTERNAL) {
+                if (external.length() > 0) external.append(", ");
+                external.append(space.getName());
+            }
+        }
+        if (physical.length() == 0 && external.length() == 0 && overlays.length() == 0) return "(none)";
+        StringBuilder out = new StringBuilder(physical.length() > 0 ? physical.toString() : "");
+        if (external.length() > 0) {
+            if (out.length() > 0) out.append(", ");
+            out.append("[external] ").append(external);
+        }
+        if (overlays.length() > 0) {
+            if (out.length() > 0) out.append(", ");
+            out.append("[overlays] ").append(overlays);
+        }
+        return out.toString();
+    }
+
+    private static String buildSpaceSuggestion(Program program, String rawOffset) {
+        // Strip leading 0x if present
+        String hex = rawOffset.toLowerCase().startsWith("0x") ? rawOffset.substring(2) : rawOffset;
+        // rawOffset isn't guaranteed to be a hex address -- a caller that passes a
+        // decompiler-visible label (e.g. Ghidra's own "DAT_<addr>" auto-name for an
+        // unresolved data reference) lands here too, since that's exactly the
+        // "couldn't resolve this as an address" path. Blindly echoing it back
+        // produces a nonsensical suggestion like "ram:DAT_41544144" -- still not
+        // valid hex, so retrying it would just fail the same way. Confirmed live
+        // 2026-07-26. Fall back to a generic placeholder when the input isn't
+        // actually hex, so the suggested example is always something that would
+        // really work.
+        if (!hex.matches("[0-9a-fA-F]+")) {
+            hex = "1000";
+        }
         StringBuilder sb = new StringBuilder();
         for (AddressSpace space : program.getAddressFactory().getAddressSpaces()) {
             if (space.isOverlaySpace()) continue;
             int type = space.getType();
             if (type == AddressSpace.TYPE_RAM || type == AddressSpace.TYPE_CODE) {
                 if (sb.length() > 0) sb.append(", ");
-                sb.append(space.getName());
-            }
-        }
-        return sb.length() > 0 ? sb.toString() : "(none)";
-    }
-
-    private static String buildSpaceSuggestion(Program program, String rawOffset) {
-        // Strip leading 0x if present
-        String hex = rawOffset.toLowerCase().startsWith("0x") ? rawOffset.substring(2) : rawOffset;
-        StringBuilder sb = new StringBuilder();
-        for (AddressSpace space : program.getAddressFactory().getAddressSpaces()) {
-            if (space.isOverlaySpace()) continue;
-            int type = space.getType();
-            if (type == AddressSpace.TYPE_RAM || type == AddressSpace.TYPE_CODE) {
+                sb.append(space.getName()).append(":").append(hex);
+            } else if (type == AddressSpace.TYPE_EXTERNAL) {
                 if (sb.length() > 0) sb.append(", ");
                 sb.append(space.getName()).append(":").append(hex);
             }
@@ -772,6 +988,28 @@ public final class ServiceUtils {
      * @return The resolved DataType, or null if not found
      */
     public static DataType resolveDataType(DataTypeManager dtm, String typeName) {
+        try {
+            return resolveDataTypeInternal(dtm, typeName);
+        } catch (IllegalArgumentException e) {
+            // Ghidra's CategoryPath(String) constructor throws this for a
+            // malformed path (empty segment from an internal "//", missing
+            // leading "/", trailing "/") when typeName itself is used to
+            // probe a category path, e.g. via dtm.getDataType("/" + typeName)
+            // below. Confirmed live 2026-07-26: this leaked through every
+            // caller's generic outer catch as a raw, unhelpful "Error
+            // processing request: Paths must have non-empty elements" --
+            // every one of this method's 18 call sites already treats a
+            // null return as "type not found" with its own clear message,
+            // so folding a malformed name into that same path is strictly
+            // more useful than exposing Ghidra's internal path-validation
+            // wording as if it were a generic request-processing failure.
+            Msg.error(ServiceUtils.class,
+                    "Invalid type name (malformed path segment): " + typeName + " -- " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static DataType resolveDataTypeInternal(DataTypeManager dtm, String typeName) {
         // ZERO: Map common C type names to Ghidra built-in DataType instances
         DataType wellKnown = resolveWellKnownType(typeName);
         if (wellKnown != null) {
@@ -808,7 +1046,7 @@ public final class ServiceUtils {
 
             try {
                 int count = Integer.parseInt(countStr);
-                DataType baseType = resolveDataType(dtm, baseTypeName);
+                DataType baseType = resolveDataTypeInternal(dtm, baseTypeName);
 
                 if (baseType != null && count > 0) {
                     ArrayDataType arrayType = new ArrayDataType(baseType, count, baseType.getLength());
@@ -835,7 +1073,7 @@ public final class ServiceUtils {
                 return new PointerDataType(dtm.getDataType("/void"));
             }
 
-            DataType baseType = resolveDataType(dtm, baseTypeName);
+            DataType baseType = resolveDataTypeInternal(dtm, baseTypeName);
             if (baseType != null) {
                 Msg.info(ServiceUtils.class, "Creating pointer type: " + typeName +
                         " (base: " + baseType.getName() + ")");

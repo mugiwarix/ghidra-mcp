@@ -17,11 +17,11 @@ on:
       ghidra_path:
         description: 'Ghidra path for live regression self-hosted runner'
         required: false
-        default: 'F:\ghidra_12.1_PUBLIC'
+        default: 'F:\ghidra_12.1.2_PUBLIC'
 
 env:
-  GHIDRA_VERSION: 12.1
-  GHIDRA_DATE: 20260513
+  GHIDRA_VERSION: 12.1.2
+  GHIDRA_DATE: 20260605
 
 # OSSF Scorecard Token-Permissions: default to read-only. The
 # create-prerelease job elevates to contents:write for the GitHub
@@ -46,13 +46,13 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
       with:
         ref: ${{ github.event.inputs.branch }}
         fetch-depth: 0
 
     - name: Set up JDK 21
-      uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9  # v4
+      uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5.6.0
       with:
         java-version: '21'
         distribution: 'temurin'
@@ -106,12 +106,34 @@ jobs:
 
         echo "Installed 15 Ghidra JARs to Maven local repository"
 
+    - name: Install uv (Python build + test gate)
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+      with:
+        enable-cache: true
+
+    - name: Set up Python (offline test gate)
+      run: uv python install 3.12
+
+    - name: Offline test gate (block pre-release on red tests)
+      run: |
+        echo "Running offline Java tests..."
+        mvn -q test -Pcoverage-gate -Dtest='com.xebyte.offline.*Test,com.xebyte.core.*Test'
+        echo "Running Python unit tests..."
+        uv run --python 3.12 --group test python -m pytest tests/unit/ --no-cov -q
+        echo "✅ Offline test gate passed"
+
     - name: Build with Maven
       run: |
         echo "Building GhidraMCP pre-release..."
         mvn clean package assembly:single -DskipTests
         echo "Build complete."
         ls -la target/GhidraMCP-*.zip 2>/dev/null || ls -la target/*.zip
+
+    - name: Build Python bridge wheel
+      run: |
+        echo "Building bridge wheel with uv..."
+        uv build
+        ls -la dist/
 
     - name: Create pre-release tag
       run: |
@@ -148,9 +170,8 @@ jobs:
           fi
         fi
 
-        # Copy essential files
-        cp bridge_mcp_ghidra.py release/
-        cp requirements.txt release/
+        # Copy essential files (bridge ships as a wheel)
+        cp dist/ghidra_mcp_bridge-*.whl release/
         cp README.md release/
         [ -f LICENSE ] && cp LICENSE release/
 
@@ -161,7 +182,7 @@ jobs:
       run: |
         VERSION="${{ github.event.inputs.version }}"
         BRANCH="${{ github.event.inputs.branch }}"
-        MCP_TOOLS=$(grep -c '@mcp.tool()' bridge_mcp_ghidra.py 2>/dev/null || echo "unknown")
+        MCP_TOOLS=$(python3 -c "import json; print(json.load(open('tests/endpoints.json'))['total_endpoints'])" 2>/dev/null || echo "unknown")
 
         cat > release_notes.md << GENEOF
         # GhidraMCP ${VERSION} Pre-Release
@@ -186,8 +207,8 @@ jobs:
         Same as stable releases:
         1. In Ghidra: **File > Install Extensions > Add** and select the ZIP
         2. Restart Ghidra, enable plugin
-        3. \`pip install -r requirements.txt\`
-        4. \`python bridge_mcp_ghidra.py\`
+        3. \`uv tool install ./ghidra_mcp_bridge-${VERSION}-py3-none-any.whl\` (or \`pip install\` the wheel)
+        4. \`bridge-mcp-ghidra\` (or \`python -m bridge_mcp_ghidra\`)
 
         ---
 
@@ -195,7 +216,7 @@ jobs:
         GENEOF
 
     - name: Create GitHub Pre-Release
-      uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+      uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
       with:
         tag_name: "v${{ github.event.inputs.version }}"
         name: "GhidraMCP ${{ github.event.inputs.version }} (Pre-Release)"

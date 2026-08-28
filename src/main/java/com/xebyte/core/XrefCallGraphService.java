@@ -53,24 +53,26 @@ public class XrefCallGraphService {
 
             ReferenceIterator refIter = refManager.getReferencesTo(addr);
 
-            List<String> refs = new ArrayList<>();
+            List<Map<String, Object>> refs = new ArrayList<>();
             while (refIter.hasNext()) {
                 Reference ref = refIter.next();
                 Address fromAddr = ref.getFromAddress();
                 RefType refType = ref.getReferenceType();
 
                 Function fromFunc = program.getFunctionManager().getFunctionContaining(fromAddr);
-                String funcInfo = (fromFunc != null) ? " in " + fromFunc.getName() : "";
 
-                refs.add(String.format("From %s%s [%s]", fromAddr, funcInfo, refType.getName()));
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("from_address", fromAddr.toString(false));
+                entry.put("type", refType.getName());
+                if (fromFunc != null) {
+                    entry.put("from_function", fromFunc.getName());
+                }
+                refs.add(entry);
             }
 
-            // Return meaningful message if no references found
-            if (refs.isEmpty()) {
-                return Response.text("No references found to address: " + addressStr);
-            }
-
-            return Response.text(ServiceUtils.paginateList(refs, offset, limit));
+            // An empty result is a normal outcome, not an error: callers read
+            // count==0 rather than parsing an English sentence.
+            return ServiceUtils.paged("references", refs, offset, limit);
         } catch (Exception e) {
             return Response.err("Error getting references to address: " + e.getMessage());
         }
@@ -123,13 +125,185 @@ public class XrefCallGraphService {
 
             // Return meaningful message if no references found
             if (refs.isEmpty()) {
-                return Response.text("No references found from address: " + addressStr);
+                return ServiceUtils.paged("references", refs, offset, limit);
             }
 
-            return Response.text(ServiceUtils.paginateList(refs, offset, limit));
+            return ServiceUtils.paged("references", refs, offset, limit);
         } catch (Exception e) {
             return Response.err("Error getting references from address: " + e.getMessage());
         }
+    }
+
+    /**
+     * Create a user-defined memory cross-reference that the analyzer could not infer
+     * (e.g. runtime-populated dispatch tables, late-bound function pointers, missed jump tables).
+     */
+    @McpTool(path = "/add_memory_reference", method = "POST",
+            description = "Create a cross-reference between two memory addresses that the auto-analyzer "
+                        + "can't infer (runtime-populated pointer tables, vtables, late-bound function "
+                        + "pointers, missed jump/switch tables). Leaves the underlying bytes untouched and "
+                        + "adds proper bidirectional navigation. On programs with multiple address spaces "
+                        + "(e.g. embedded targets), prefix addresses with the space name (mem:1000).",
+            category = "xref")
+    public Response addMemoryReference(
+            @Param(value = "from_address", paramType = "address", source = ParamSource.BODY,
+                   description = "Source address the reference originates from (the table slot / instruction). "
+                               + "Accepts 0x<hex> or <space>:<hex> (e.g. mem:1000).") String fromAddressStr,
+            @Param(value = "to_address", paramType = "address", source = ParamSource.BODY,
+                   description = "Target address the reference points to. Accepts 0x<hex> or <space>:<hex>.") String toAddressStr,
+            @Param(value = "ref_type", source = ParamSource.BODY, defaultValue = "DATA",
+                   description = "Reference type (case-insensitive RefType name): DATA, READ, WRITE, READ_WRITE, "
+                               + "COMPUTED_CALL, UNCONDITIONAL_CALL, COMPUTED_JUMP, UNCONDITIONAL_JUMP, "
+                               + "CONDITIONAL_JUMP, INDIRECTION, etc.") String refTypeStr,
+            @Param(value = "source_type", source = ParamSource.BODY, defaultValue = "USER_DEFINED",
+                   description = "SourceType: USER_DEFINED (default — distinct from analyzer refs and survives "
+                               + "re-analysis), ANALYSIS, IMPORTED, DEFAULT.") String sourceTypeStr,
+            @Param(value = "operand_index", source = ParamSource.BODY, defaultValue = "-1",
+                   description = "Operand index the reference attaches to. -1 = mnemonic/data operand.") int operandIndex,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (fromAddressStr == null || fromAddressStr.isEmpty()) return Response.err("from_address is required");
+        if (toAddressStr == null || toAddressStr.isEmpty()) return Response.err("to_address is required");
+
+        Address fromAddr = ServiceUtils.parseAddress(program, fromAddressStr);
+        if (fromAddr == null) return Response.err("from_address: " + ServiceUtils.getLastParseError());
+        Address toAddr = ServiceUtils.parseAddress(program, toAddressStr);
+        if (toAddr == null) return Response.err("to_address: " + ServiceUtils.getLastParseError());
+
+        RefType refType = resolveMemoryRefType(refTypeStr);
+        if (refType == null) {
+            return Response.err("Unknown ref_type '" + refTypeStr + "'. Valid names include: "
+                    + "DATA, READ, WRITE, READ_WRITE, COMPUTED_CALL, UNCONDITIONAL_CALL, CONDITIONAL_CALL, "
+                    + "COMPUTED_JUMP, UNCONDITIONAL_JUMP, CONDITIONAL_JUMP, INDIRECTION");
+        }
+        SourceType sourceType;
+        try {
+            sourceType = SourceType.valueOf(sourceTypeStr == null ? "" : sourceTypeStr.trim().toUpperCase(Locale.ROOT));
+        } catch (Exception e) {
+            return Response.err("Unknown source_type '" + sourceTypeStr
+                    + "'. Valid values: USER_DEFINED, ANALYSIS, IMPORTED, DEFAULT.");
+        }
+
+        try {
+            return threadingStrategy.executeWrite(program, "Add memory reference", () -> {
+                ReferenceManager refMgr = program.getReferenceManager();
+                Reference ref = refMgr.addMemoryReference(fromAddr, toAddr, refType, sourceType, operandIndex);
+                if (ref == null) {
+                    return Response.err("Failed to create reference from " + fromAddr + " to " + toAddr);
+                }
+                return Response.ok(JsonHelper.mapOf(
+                        "status", "success",
+                        "from_address", fromAddr.toString(),
+                        "to_address", toAddr.toString(),
+                        "ref_type", refType.getName(),
+                        "source_type", sourceType.toString(),
+                        "operand_index", operandIndex,
+                        "is_primary", ref.isPrimary()));
+            });
+        } catch (Exception e) {
+            return Response.err("Error adding memory reference: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Remove memory cross-reference(s) between two addresses — the inverse of
+     * {@link #addMemoryReference}. Useful for clearing references the analyzer got wrong
+     * or for undoing a manual reference.
+     */
+    @McpTool(path = "/remove_reference", method = "POST",
+            description = "Remove memory cross-reference(s) from one address to another (the inverse of "
+                        + "add_memory_reference). Removes every reference from_address -> to_address "
+                        + "regardless of operand by default; pass operand_index >= 0 to remove only the "
+                        + "reference on that operand. Removes both user-defined and analyzer-inferred "
+                        + "references — the response reports each removed reference's source_type. "
+                        + "On multi-space programs, prefix addresses with the space name (mem:1000).",
+            category = "xref")
+    public Response removeReference(
+            @Param(value = "from_address", paramType = "address", source = ParamSource.BODY,
+                   description = "Source address the reference originates from. Accepts 0x<hex> or <space>:<hex>.") String fromAddressStr,
+            @Param(value = "to_address", paramType = "address", source = ParamSource.BODY,
+                   description = "Target address the reference points to. Accepts 0x<hex> or <space>:<hex>.") String toAddressStr,
+            @Param(value = "operand_index", source = ParamSource.BODY, defaultValue = "-1",
+                   description = "Operand index to match. -1 (default) = remove references on any operand; "
+                               + ">= 0 = remove only the reference on that operand.") int operandIndex,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (fromAddressStr == null || fromAddressStr.isEmpty()) return Response.err("from_address is required");
+        if (toAddressStr == null || toAddressStr.isEmpty()) return Response.err("to_address is required");
+
+        Address fromAddr = ServiceUtils.parseAddress(program, fromAddressStr);
+        if (fromAddr == null) return Response.err("from_address: " + ServiceUtils.getLastParseError());
+        Address toAddr = ServiceUtils.parseAddress(program, toAddressStr);
+        if (toAddr == null) return Response.err("to_address: " + ServiceUtils.getLastParseError());
+
+        // Collect the matching references up front, then delete inside the transaction.
+        List<Reference> matches = new ArrayList<>();
+        for (Reference ref : program.getReferenceManager().getReferencesFrom(fromAddr)) {
+            if (!ref.getToAddress().equals(toAddr)) continue;
+            if (operandIndex >= 0 && ref.getOperandIndex() != operandIndex) continue;
+            matches.add(ref);
+        }
+
+        List<Map<String, Object>> details = new ArrayList<>();
+        for (Reference ref : matches) {
+            details.add(JsonHelper.mapOf(
+                    "to_address", ref.getToAddress().toString(),
+                    "operand_index", ref.getOperandIndex(),
+                    "ref_type", ref.getReferenceType().getName(),
+                    "source_type", ref.getSource().toString()));
+        }
+
+        if (matches.isEmpty()) {
+            return Response.ok(JsonHelper.mapOf(
+                    "status", "success",
+                    "removed", 0,
+                    "message", "No reference found from " + fromAddr + " to " + toAddr));
+        }
+
+        try {
+            return threadingStrategy.executeWrite(program, "Remove memory reference", () -> {
+                ReferenceManager refMgr = program.getReferenceManager();
+                for (Reference ref : matches) {
+                    refMgr.delete(ref);
+                }
+                return Response.ok(JsonHelper.mapOf(
+                        "status", "success",
+                        "from_address", fromAddr.toString(),
+                        "to_address", toAddr.toString(),
+                        "removed", matches.size(),
+                        "references", details));
+            });
+        } catch (Exception e) {
+            return Response.err("Error removing reference: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Resolve a case-insensitive {@link RefType} name to its static constant.
+     * Reflects over RefType's public static fields so every valid name (data + flow types)
+     * is accepted, matching the names callers see in the listing.
+     */
+    private static RefType resolveMemoryRefType(String name) {
+        if (name == null || name.trim().isEmpty()) return null;
+        String want = name.trim().toUpperCase(Locale.ROOT);
+        for (java.lang.reflect.Field f : RefType.class.getFields()) {
+            if (java.lang.reflect.Modifier.isStatic(f.getModifiers())
+                    && RefType.class.isAssignableFrom(f.getType())
+                    && f.getName().equals(want)) {
+                try {
+                    return (RefType) f.get(null);
+                } catch (IllegalAccessException e) {
+                    return null;
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -148,10 +322,10 @@ public class XrefCallGraphService {
 
         try {
             FunctionRef.Result resolved = FunctionRef.ofNameOrAddress(functionName, address).tryResolve(program);
-            if (!resolved.isSuccess()) return Response.text("No references found to function: " + functionName);
+            if (!resolved.isSuccess()) return Response.err("Function not found: " + functionName);
             Function function = resolved.function();
 
-            List<String> refs = new ArrayList<>();
+            List<Map<String, Object>> refs = new ArrayList<>();
             FunctionManager funcManager = program.getFunctionManager();
             Address entryPoint = function.getEntryPoint();
             ReferenceIterator refIter = program.getReferenceManager().getReferencesTo(entryPoint);
@@ -162,16 +336,17 @@ public class XrefCallGraphService {
                 RefType refType = ref.getReferenceType();
 
                 Function fromFunc = funcManager.getFunctionContaining(fromAddr);
-                String funcInfo = (fromFunc != null) ? " in " + fromFunc.getName() : "";
 
-                refs.add(String.format("From %s%s [%s]", fromAddr, funcInfo, refType.getName()));
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("from_address", fromAddr.toString(false));
+                entry.put("type", refType.getName());
+                if (fromFunc != null) {
+                    entry.put("from_function", fromFunc.getName());
+                }
+                refs.add(entry);
             }
 
-            if (refs.isEmpty()) {
-                return Response.text("No references found to function: " + functionName);
-            }
-
-            return Response.text(ServiceUtils.paginateList(refs, offset, limit));
+            return ServiceUtils.paged("references", refs, offset, limit);
         } catch (Exception e) {
             return Response.err("Error getting function references: " + e.getMessage());
         }
@@ -205,7 +380,7 @@ public class XrefCallGraphService {
         // Find the function by name or address
         FunctionRef.Result resolved = FunctionRef.ofNameOrAddress(functionName, address).tryResolve(program);
         if (!resolved.isSuccess()) {
-            return Response.text("Function not found: " + functionName);
+            return Response.err("Function not found: " + functionName);
         }
         Function function = resolved.function();
 
@@ -244,43 +419,25 @@ public class XrefCallGraphService {
         List<Address> sortedTargets = new ArrayList<>(jumpTargets);
         Collections.sort(sortedTargets);
 
-        int count = 0;
-        int skipped = 0;
-
+        // Build the full result set and let the envelope do the paging, so
+        // `total` reports every target rather than just this page.
+        List<Map<String, Object>> targets = new ArrayList<>();
         for (Address target : sortedTargets) {
-            if (count >= limit) break;
-
-            if (skipped < offset) {
-                skipped++;
-                continue;
-            }
-
-            if (sb.length() > 0) {
-                sb.append("\n");
-            }
-
-            // Add context about what's at this address
-            String context = "";
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("address", target.toString(false));
             Function targetFunc = functionManager.getFunctionContaining(target);
             if (targetFunc != null) {
-                context = " (in " + targetFunc.getName() + ")";
+                entry.put("in_function", targetFunc.getName());
             } else {
-                // Check if there's a label at this address
                 Symbol symbol = program.getSymbolTable().getPrimarySymbol(target);
                 if (symbol != null) {
-                    context = " (" + symbol.getName() + ")";
+                    entry.put("label", symbol.getName());
                 }
             }
-
-            sb.append(target.toString()).append(context);
-            count++;
+            targets.add(entry);
         }
 
-        if (sb.length() == 0) {
-            return Response.text("No jump targets found in function: " + functionName);
-        }
-
-        return Response.text(sb.toString());
+        return ServiceUtils.paged("jump_targets", targets, offset, limit);
     }
 
     // -----------------------------------------------------------------------
@@ -307,7 +464,7 @@ public class XrefCallGraphService {
         // Find the function by name or address
         FunctionRef.Result resolved = FunctionRef.ofNameOrAddress(functionName, address).tryResolve(program);
         if (!resolved.isSuccess()) {
-            return Response.text("Function not found: " + functionName);
+            return Response.err("Function not found: " + functionName);
         }
         Function function = resolved.function();
 
@@ -341,30 +498,15 @@ public class XrefCallGraphService {
         List<Function> sortedCallees = new ArrayList<>(callees);
         sortedCallees.sort((f1, f2) -> f1.getName().compareTo(f2.getName()));
 
-        int count = 0;
-        int skipped = 0;
-
+        List<Map<String, Object>> calleeList = new ArrayList<>();
         for (Function callee : sortedCallees) {
-            if (count >= limit) break;
-
-            if (skipped < offset) {
-                skipped++;
-                continue;
-            }
-
-            if (sb.length() > 0) {
-                sb.append("\n");
-            }
-
-            sb.append(String.format("%s @ %s", callee.getName(), callee.getEntryPoint()));
-            count++;
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("name", callee.getName());
+            entry.put("address", callee.getEntryPoint().toString(false));
+            calleeList.add(entry);
         }
 
-        if (sb.length() == 0) {
-            return Response.text("No callees found for function: " + functionName);
-        }
-
-        return Response.text(sb.toString());
+        return ServiceUtils.paged("callees", calleeList, offset, limit);
     }
 
     /**
@@ -388,54 +530,34 @@ public class XrefCallGraphService {
         Function targetFunction = null;
         FunctionRef.Result resolved = FunctionRef.ofNameOrAddress(functionName, address).tryResolve(program);
         if (!resolved.isSuccess()) {
-            return Response.text("Function not found: " + functionName);
+            return Response.err("Function not found: " + functionName);
         }
         targetFunction = resolved.function();
 
         Set<Function> callers = new HashSet<>();
         ReferenceManager refManager = program.getReferenceManager();
 
-        // Get all references to this function's entry point
-        ReferenceIterator refIter = refManager.getReferencesTo(targetFunction.getEntryPoint());
-        while (refIter.hasNext()) {
-            Reference ref = refIter.next();
-            if (ref.getReferenceType().isCall()) {
-                Address fromAddr = ref.getFromAddress();
-                Function callerFunc = functionManager.getFunctionContaining(fromAddr);
-                if (callerFunc != null) {
-                    callers.add(callerFunc);
-                }
-            }
+        collectCallersFromAddressRefs(callers, functionManager, refManager, targetFunction.getEntryPoint());
+
+        try {
+            callers.addAll(targetFunction.getCallingFunctions(null));
+        } catch (Exception ignored) {
+            // Fall back to address refs only if Ghidra cannot compute calling functions.
         }
 
         // Convert to sorted list and apply pagination
         List<Function> sortedCallers = new ArrayList<>(callers);
         sortedCallers.sort((f1, f2) -> f1.getName().compareTo(f2.getName()));
 
-        int count = 0;
-        int skipped = 0;
-
+        List<Map<String, Object>> callerList = new ArrayList<>();
         for (Function caller : sortedCallers) {
-            if (count >= limit) break;
-
-            if (skipped < offset) {
-                skipped++;
-                continue;
-            }
-
-            if (sb.length() > 0) {
-                sb.append("\n");
-            }
-
-            sb.append(String.format("%s @ %s", caller.getName(), caller.getEntryPoint()));
-            count++;
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("name", caller.getName());
+            entry.put("address", caller.getEntryPoint().toString(false));
+            callerList.add(entry);
         }
 
-        if (sb.length() == 0) {
-            return Response.text("No callers found for function: " + functionName);
-        }
-
-        return Response.text(sb.toString());
+        return ServiceUtils.paged("callers", callerList, offset, limit);
     }
 
     // -----------------------------------------------------------------------
@@ -463,7 +585,7 @@ public class XrefCallGraphService {
         Function rootFunction = null;
         FunctionRef.Result resolved = FunctionRef.ofNameOrAddress(functionName, address).tryResolve(program);
         if (!resolved.isSuccess()) {
-            return Response.text("Function not found: " + functionName);
+            return Response.err("Function not found: " + functionName);
         }
         rootFunction = resolved.function();
 
@@ -480,35 +602,55 @@ public class XrefCallGraphService {
             buildCallGraphCallers(rootFunction, depth, visited, callGraph, functionManager, program);
         }
 
-        // Format output as edges
+        List<Map<String, Object>> edges = new ArrayList<>();
         for (Map.Entry<String, Set<String>> entry : callGraph.entrySet()) {
-            String caller = entry.getKey();
             for (String callee : entry.getValue()) {
-                if (sb.length() > 0) {
-                    sb.append("\n");
-                }
-                sb.append(caller).append(" -> ").append(callee);
+                Map<String, Object> edge = new LinkedHashMap<>();
+                edge.put("caller", entry.getKey());
+                edge.put("callee", callee);
+                edges.add(edge);
             }
         }
 
-        if (sb.length() == 0) {
-            return Response.text("No call graph relationships found for function: " + functionName);
-        }
-
-        return Response.text(sb.toString());
+        return ServiceUtils.listed("edges", edges);
     }
 
     /**
      * Helper method to build call graph for callees (what this function calls)
      */
+    /**
+     * Graph-identity key for a function. Namespace-qualified name plus entry
+     * address — unique across namespaces, overloads, and overlay spaces while
+     * keeping text-format output (dot/mermaid/adjacency) human-readable.
+     * Bare {@code getName()} collapsed distinct same-named functions: the
+     * second was skipped by {@code visited}, its callee set was overwritten by
+     * {@code callGraph.put}, and SCC/cycle results were computed on a merged
+     * pseudo-node.
+     */
+    private static String graphKey(Function f) {
+        return f.getName(true) + "@" + f.getEntryPoint();
+    }
+
+    /**
+     * Resolve a user-supplied function name (or address) to its graph key.
+     * Returns the input unchanged if resolution fails so a caller who already
+     * passes a {@code name@addr} key still matches.
+     */
+    private static String resolveToGraphKey(Program program, String nameOrAddr) {
+        if (nameOrAddr == null || nameOrAddr.isEmpty()) return nameOrAddr;
+        FunctionRef.Result r = FunctionRef.ofNameOrAddress(nameOrAddr, null).tryResolve(program);
+        return r.isSuccess() ? graphKey(r.function()) : nameOrAddr;
+    }
+
     private void buildCallGraphCallees(Function function, int depth, Set<String> visited,
                                      Map<String, Set<String>> callGraph, FunctionManager functionManager,
                                      Program program) {
-        if (depth <= 0 || visited.contains(function.getName())) {
+        String key = graphKey(function);
+        if (depth <= 0 || visited.contains(key)) {
             return;
         }
 
-        visited.add(function.getName());
+        visited.add(key);
         Set<String> callees = new HashSet<>();
 
         // Find callees of this function
@@ -527,7 +669,7 @@ public class XrefCallGraphService {
                         Address targetAddr = ref.getToAddress();
                         Function targetFunc = functionManager.getFunctionAt(targetAddr);
                         if (targetFunc != null) {
-                            callees.add(targetFunc.getName());
+                            callees.add(graphKey(targetFunc));
                             // Recursively build graph for callees
                             buildCallGraphCallees(targetFunc, depth - 1, visited, callGraph, functionManager, program);
                         }
@@ -537,7 +679,7 @@ public class XrefCallGraphService {
         }
 
         if (!callees.isEmpty()) {
-            callGraph.put(function.getName(), callees);
+            callGraph.put(key, callees);
         }
     }
 
@@ -547,26 +689,42 @@ public class XrefCallGraphService {
     private void buildCallGraphCallers(Function function, int depth, Set<String> visited,
                                      Map<String, Set<String>> callGraph, FunctionManager functionManager,
                                      Program program) {
-        if (depth <= 0 || visited.contains(function.getName())) {
+        String key = graphKey(function);
+        if (depth <= 0 || visited.contains(key)) {
             return;
         }
 
-        visited.add(function.getName());
+        visited.add(key);
         ReferenceManager refManager = program.getReferenceManager();
 
-        // Find callers of this function
-        ReferenceIterator refIter = refManager.getReferencesTo(function.getEntryPoint());
+        Set<Function> callers = new HashSet<>();
+        collectCallersFromAddressRefs(callers, functionManager, refManager, function.getEntryPoint());
+        try {
+            callers.addAll(function.getCallingFunctions(null));
+        } catch (Exception ignored) {
+            // Keep the reference-only result if Ghidra cannot compute callers here.
+        }
+
+        for (Function callerFunc : callers) {
+            if (callerFunc != null) {
+                callGraph.computeIfAbsent(graphKey(callerFunc), k -> new HashSet<>()).add(key);
+                buildCallGraphCallers(callerFunc, depth - 1, visited, callGraph, functionManager, program);
+            }
+        }
+    }
+
+    private static void collectCallersFromAddressRefs(Set<Function> callers, FunctionManager functionManager,
+                                                      ReferenceManager refManager, Address entryPoint) {
+        ReferenceIterator refIter = refManager.getReferencesTo(entryPoint);
         while (refIter.hasNext()) {
             Reference ref = refIter.next();
-            if (ref.getReferenceType().isCall()) {
-                Address fromAddr = ref.getFromAddress();
-                Function callerFunc = functionManager.getFunctionContaining(fromAddr);
-                if (callerFunc != null) {
-                    String callerName = callerFunc.getName();
-                    callGraph.computeIfAbsent(callerName, k -> new HashSet<>()).add(function.getName());
-                    // Recursively build graph for callers
-                    buildCallGraphCallers(callerFunc, depth - 1, visited, callGraph, functionManager, program);
-                }
+            if (!ref.getReferenceType().isCall()) {
+                continue;
+            }
+            Address fromAddr = ref.getFromAddress();
+            Function callerFunc = functionManager.getFunctionContaining(fromAddr);
+            if (callerFunc != null) {
+                callers.add(callerFunc);
             }
         }
     }
@@ -603,9 +761,14 @@ public class XrefCallGraphService {
                 break;
             }
 
-            String functionName = function.getName();
+            String functionKey = graphKey(function);
             String callerAddr = function.getEntryPoint().toString();
             Set<String> callees = new HashSet<>();
+            // Dedupe json_edges on callee ADDRESS, independent of the
+            // name-based callees set used by the text formats — otherwise a
+            // call to a *different* function that happens to share a name
+            // would be dropped from json_edges too.
+            Set<String> calleeAddrs = addressEdges != null ? new HashSet<>() : null;
 
             // Find all functions called by this function
             AddressSetView functionBody = function.getBody();
@@ -621,16 +784,21 @@ public class XrefCallGraphService {
                             Address targetAddr = ref.getToAddress();
                             Function targetFunc = functionManager.getFunctionAt(targetAddr);
                             if (targetFunc != null) {
-                                String calleeName = targetFunc.getName();
-                                // Deduplicate: only count each caller→callee pair once
-                                if (callees.add(calleeName)) {
+                                String calleeKey = graphKey(targetFunc);
+                                String calleeAddr = targetFunc.getEntryPoint().toString();
+                                // Deduplicate: only count each caller→callee pair once.
+                                // For json_edges, dedupe on address (the stable id);
+                                // for text formats, dedupe on the graph key.
+                                boolean newForText = callees.add(calleeKey);
+                                boolean newForJson = calleeAddrs != null && calleeAddrs.add(calleeAddr);
+                                if (newForText || newForJson) {
                                     relationshipCount++;
-                                    if (addressEdges != null) {
+                                    if (newForJson) {
                                         addressEdges.add(Map.of(
                                             "caller_addr", callerAddr,
-                                            "callee_addr", targetFunc.getEntryPoint().toString(),
-                                            "caller_name", functionName,
-                                            "callee_name", calleeName
+                                            "callee_addr", calleeAddr,
+                                            "caller_name", function.getName(),
+                                            "callee_name", targetFunc.getName()
                                         ));
                                     }
                                     if (relationshipCount >= effectiveLimit) {
@@ -644,7 +812,7 @@ public class XrefCallGraphService {
             }
 
             if (!callees.isEmpty()) {
-                callGraph.put(functionName, callees);
+                callGraph.put(functionKey, callees);
             }
         }
 
@@ -669,6 +837,11 @@ public class XrefCallGraphService {
                 }
             }
             sb.append("}");
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("format", "dot");
+            out.put("diagram", sb.toString());
+            out.put("count", callGraph.size());
+            return Response.ok(out);
         } else if ("mermaid".equals(format)) {
             sb.append("graph TD\n");
             for (Map.Entry<String, Set<String>> entry : callGraph.entrySet()) {
@@ -678,31 +851,37 @@ public class XrefCallGraphService {
                     sb.append("  ").append(caller).append(" --> ").append(callee).append("\n");
                 }
             }
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("format", "mermaid");
+            out.put("diagram", sb.toString());
+            out.put("count", callGraph.size());
+            return Response.ok(out);
         } else if ("adjacency".equals(format)) {
+            Map<String, Object> adjacency = new LinkedHashMap<>();
             for (Map.Entry<String, Set<String>> entry : callGraph.entrySet()) {
-                if (sb.length() > 0) {
-                    sb.append("\n");
-                }
-                sb.append(entry.getKey()).append(": ");
-                sb.append(String.join(", ", entry.getValue()));
+                adjacency.put(entry.getKey(), new ArrayList<>(entry.getValue()));
             }
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("format", "adjacency");
+            out.put("adjacency", adjacency);
+            out.put("count", adjacency.size());
+            return Response.ok(out);
         } else { // Default "edges" format
+            List<Map<String, Object>> edges = new ArrayList<>();
             for (Map.Entry<String, Set<String>> entry : callGraph.entrySet()) {
-                String caller = entry.getKey();
                 for (String callee : entry.getValue()) {
-                    if (sb.length() > 0) {
-                        sb.append("\n");
-                    }
-                    sb.append(caller).append(" -> ").append(callee);
+                    Map<String, Object> edge = new LinkedHashMap<>();
+                    edge.put("caller", entry.getKey());
+                    edge.put("callee", callee);
+                    edges.add(edge);
                 }
             }
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("format", "edges");
+            out.put("edges", edges);
+            out.put("count", edges.size());
+            return Response.ok(out);
         }
-
-        if (sb.length() == 0) {
-            return Response.text("No call relationships found in the program");
-        }
-
-        return Response.text(sb.toString());
     }
 
     // -----------------------------------------------------------------------
@@ -734,8 +913,8 @@ public class XrefCallGraphService {
             for (Function func : functionManager.getFunctions(true)) {
                 if (func.isThunk()) continue;
 
-                String funcName = func.getName();
-                functionAddresses.put(funcName, func.getEntryPoint().toString());
+                String funcKey = graphKey(func);
+                functionAddresses.put(funcKey, func.getEntryPoint().toString());
                 Set<String> callees = new HashSet<>();
 
                 Listing listing = program.getListing();
@@ -748,7 +927,7 @@ public class XrefCallGraphService {
                             if (ref.getReferenceType().isCall()) {
                                 Function calledFunc = functionManager.getFunctionAt(ref.getToAddress());
                                 if (calledFunc != null && !calledFunc.isThunk()) {
-                                    callees.add(calledFunc.getName());
+                                    callees.add(graphKey(calledFunc));
                                 }
                             }
                         }
@@ -756,7 +935,7 @@ public class XrefCallGraphService {
                 }
 
                 if (!callees.isEmpty()) {
-                    callGraph.put(funcName, callees);
+                    callGraph.put(funcKey, callees);
                 }
             }
 
@@ -783,8 +962,13 @@ public class XrefCallGraphService {
                 ));
 
             } else if ("path".equals(analysisType) && startFunction != null && endFunction != null) {
+                // Resolve user-supplied names to graph keys so they match the
+                // callGraph's name@addr keying. Falls back to the raw input so
+                // a caller who already passes a fully-qualified key still works.
+                String startKey = resolveToGraphKey(program, startFunction);
+                String endKey = resolveToGraphKey(program, endFunction);
                 // Find shortest path between two functions using BFS
-                List<String> path = findShortestPath(callGraph, startFunction, endFunction);
+                List<String> path = findShortestPath(callGraph, startKey, endKey);
 
                 if (path != null) {
                     return Response.ok(JsonHelper.mapOf(

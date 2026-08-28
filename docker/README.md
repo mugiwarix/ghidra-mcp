@@ -2,6 +2,23 @@
 
 Run GhidraMCP as a headless REST API server in Docker containers.
 
+> **⚠️ Security: set an auth token before exposing the port.**
+> The container binds `0.0.0.0` inside its namespace, and `docker-compose.yml`
+> publishes `8089:8089` to the host. The MCP API is **unauthenticated unless
+> `GHIDRA_MCP_AUTH_TOKEN` is set**, and it exposes powerful endpoints (file
+> import, project mutation, and — if `GHIDRA_MCP_ALLOW_SCRIPTS=1` — arbitrary
+> code). The headless server **refuses to start on a non-loopback bind without
+> this token**, so for any host/remote exposure you must set it:
+>
+> ```bash
+> export GHIDRA_MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+> # then pass it into the container (compose: environment:) and send it as
+> #   Authorization: Bearer <token>   on every request
+> ```
+>
+> Leave it unset only when the published port is reachable solely from
+> localhost/trusted hosts. The image runs as a non-root `ghidra` user.
+
 ## Quick Start
 
 ### Single Instance
@@ -89,11 +106,11 @@ The headless server exposes the same REST API as the GUI plugin. Currently imple
 
 ### Modification (POST)
 - `POST /rename_function` - Rename function by name
-- `POST /rename_function_by_address` - Rename function by address
-- `POST /rename_data` - Rename data label
-- `POST /rename_variable` - Rename variable
-- `POST /set_decompiler_comment` - Set PRE_COMMENT
-- `POST /set_disassembly_comment` - Set EOL_COMMENT
+- `POST /rename_function` - Rename function by address
+- `POST /rename_symbol` - Rename data label
+- `POST /rename_variables` - Rename variable
+- `POST /set_comment(type='pre')` - Set PRE_COMMENT
+- `POST /set_comment(type='eol')` - Set EOL_COMMENT
 
 ### Program Management
 - `GET /list_open_programs` - List loaded programs

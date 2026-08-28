@@ -3,17 +3,28 @@ package com.xebyte.core;
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.plugin.core.clear.ClearFlowAndRepairCmd;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressOutOfBoundsException;
+import ghidra.program.model.listing.Bookmark;
+import ghidra.program.model.address.AddressOverflowException;
 import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.data.Pointer;
+import ghidra.program.model.data.Structure;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.lang.InjectPayload;
+import ghidra.program.model.symbol.Namespace;
 import ghidra.program.model.pcode.HighFunction;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
 import ghidra.program.model.pcode.HighFunctionDBUtil.ReturnCommitOption;
 import ghidra.program.model.pcode.HighSymbol;
 import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.pcode.LocalSymbolMap;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.program.model.symbol.SymbolTable;
@@ -23,6 +34,8 @@ import ghidra.util.Msg;
 import ghidra.util.task.ConsoleTaskMonitor;
 
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.swing.SwingUtilities;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -37,6 +50,11 @@ import java.util.concurrent.atomic.AtomicReference;
 public class FunctionService {
 
     private static final int DECOMPILE_TIMEOUT_SECONDS = 60;  // Increased from 30s to 60s for large functions
+    private static final int MAX_DECOMPILE_TIMEOUT_SECONDS = 1800;
+
+    /** Matches any of the five Windows calling-convention keywords. */
+    private static final Pattern CALLING_CONV_PATTERN = Pattern.compile(
+            "\\b(__cdecl|__stdcall|__thiscall|__fastcall|__vectorcall)\\b");
 
     // Shorter cap for the no-retry scoring/analysis path. Keeps EDT-holding
     // decompiles under Ghidra's 20-second Swing deadlock threshold so internal
@@ -84,6 +102,11 @@ public class FunctionService {
         }
     }
 
+    static record NoReturnUpdateResult(
+            boolean functionNoReturn,
+            boolean terminalNoReturn) {
+    }
+
     // ========================================================================
     // Decompilation methods
     // ========================================================================
@@ -97,16 +120,19 @@ public class FunctionService {
         Program program = pe.program();
         DecompInterface decomp = null;
         try {
-            decomp = new DecompInterface();
-            decomp.openProgram(program);
+            decomp = ServiceUtils.createConfiguredDecompiler(program);
             for (Function func : program.getFunctionManager().getFunctions(true)) {
                 if (func.getName().equals(name)) {
                     DecompileResults result =
                         decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
                     if (result != null && result.decompileCompleted()) {
-                        return Response.text(result.getDecompiledFunction().getC());
+                        Map<String, Object> out = new LinkedHashMap<>();
+                        out.put("name", func.getName());
+                        out.put("address", func.getEntryPoint().toString(false));
+                        out.put("decompiled", result.getDecompiledFunction().getC());
+                        return Response.ok(out);
                     } else {
-                        return Response.text("Decompilation failed");
+                        return Response.err("Decompilation failed");
                     }
                 }
             }
@@ -115,7 +141,7 @@ public class FunctionService {
                 try { decomp.dispose(); } catch (Exception ignored) {}
             }
         }
-        return Response.text("Function not found");
+        return Response.err("Function not found");
     }
 
     public Response decompileFunctionByName(String name) {
@@ -126,28 +152,34 @@ public class FunctionService {
      * Decompile a function at the given address.
      * If programName is provided, uses that program instead of the current one.
      */
-    @McpTool(path = "/decompile_function", description = "Decompile function at address to pseudocode. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
+    @McpTool(path = "/decompile_function", description = "Decompile ONE function (address) OR MANY (functions=comma-separated names/addresses) to pseudocode. On programs with multiple address spaces, prefix addresses with the space name (mem:1000). Replaces batch_decompile.", category = "function")
     public Response decompileFunctionByAddress(
-            @Param(value = "address", paramType = "address",
-                   description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
-                               + "(e.g., mem:1000, code:ff00). Note: some programs — particularly "
-                               + "embedded/microcontroller targets — are not address-space-agnostic; "
-                               + "use get_address_spaces to discover spaces before assuming a plain hex "
-                               + "address is unambiguous.") String addressStr,
+            @Param(value = "address", paramType = "address", defaultValue = "",
+                   description = "Function address or name (single mode). 0x<hex> or <space>:<hex>. Omit when using functions=.") String addressStr,
+            @Param(value = "functions", defaultValue = "",
+                   description = "Bulk mode: comma-separated function references (names or addresses). When set, address is ignored.") String functionsParam,
             @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName,
             @Param(value = "timeout", defaultValue = "60", description = "Decompile timeout in seconds") int timeoutSeconds) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
-        if (addressStr == null || addressStr.isEmpty()) return Response.err("Address or function name is required");
+        if (functionsParam != null && !functionsParam.trim().isEmpty()) {
+            return batchDecompileFunctions(functionsParam, programName);
+        }
+        if (addressStr == null || addressStr.isEmpty()) return Response.err("Address or function name is required (or pass functions= for bulk)");
+        // Checked after the bulk dispatch, not before: batchDecompileFunctions
+        // takes no timeout, so validating it there would reject a bulk call
+        // over a parameter that path never reads.
+        if (timeoutSeconds <= 0 || timeoutSeconds > MAX_DECOMPILE_TIMEOUT_SECONDS) {
+            return Response.err("timeout must be between 1 and " + MAX_DECOMPILE_TIMEOUT_SECONDS + " seconds");
+        }
 
         DecompInterface decomp = null;
         try {
             Function func = ServiceUtils.resolveFunction(program, addressStr);
             if (func == null) return Response.err("No function found for " + addressStr);
 
-            decomp = new DecompInterface();
-            decomp.openProgram(program);
+            decomp = ServiceUtils.createConfiguredDecompiler(program);
             DecompileResults decompResult = decomp.decompileFunction(func, timeoutSeconds, new ConsoleTaskMonitor());
 
             if (decompResult == null) {
@@ -164,7 +196,11 @@ public class FunctionService {
                 return Response.err("Decompiler completed but returned null decompiled function.");
             }
 
-            return Response.text(decompResult.getDecompiledFunction().getC());
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("name", func.getName());
+            out.put("address", func.getEntryPoint().toString(false));
+            out.put("decompiled", decompResult.getDecompiledFunction().getC());
+            return Response.ok(out);
         } catch (Throwable e) {
             String msg = e.getMessage() != null ? e.getMessage() : e.toString();
             return Response.err("Error decompiling function: " + msg);
@@ -176,6 +212,10 @@ public class FunctionService {
     }
 
     // Backward compatible overloads for internal callers
+    public Response decompileFunctionByAddress(String addressStr, String programName, int timeout) {
+        return decompileFunctionByAddress(addressStr, "", programName, timeout);
+    }
+
     public Response decompileFunctionByAddress(String addressStr, String programName) {
         return decompileFunctionByAddress(addressStr, programName, DECOMPILE_TIMEOUT_SECONDS);
     }
@@ -203,9 +243,7 @@ public class FunctionService {
     public DecompileResults decompileFunctionNoRetry(Function func, Program program) {
         DecompInterface decomp = null;
         try {
-            decomp = new DecompInterface();
-            decomp.openProgram(program);
-            decomp.setSimplificationStyle("decompile");
+            decomp = ServiceUtils.createConfiguredDecompiler(program);
             return decomp.decompileFunction(func, NO_RETRY_DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
         } catch (Exception e) {
             Msg.warn(this, "Single-attempt decompile failed for " + func.getName() + ": " + e.getMessage());
@@ -230,9 +268,7 @@ public class FunctionService {
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                decomp = new DecompInterface();
-                decomp.openProgram(program);
-                decomp.setSimplificationStyle("decompile");
+                decomp = ServiceUtils.createConfiguredDecompiler(program);
 
                 // On retry attempts, flush cache first and increase timeout
                 if (attempt > 1) {
@@ -288,7 +324,7 @@ public class FunctionService {
     /**
      * Batch decompile multiple functions by name.
      */
-        @McpTool(path = "/batch_decompile", description = "Decompile multiple functions at once. Accepts comma-separated function names or addresses.", category = "function")
+    // Bulk helper for decompile_function(functions=...). Merged into decompile_function in 7.0.0.
     public Response batchDecompileFunctions(
             @Param(value = "functions", description = "Comma-separated function references (names or addresses)") String functionsParam,
             @Param(value = "program", defaultValue = "") String programName) {
@@ -319,8 +355,7 @@ public class FunctionService {
                 // Decompile the function
                 DecompInterface decompiler = null;
                 try {
-                    decompiler = new DecompInterface();
-                    decompiler.openProgram(program);
+                    decompiler = ServiceUtils.createConfiguredDecompiler(program);
                     DecompileResults decompResults = decompiler.decompileFunction(function, 30, null);
 
                     if (decompResults != null && decompResults.decompileCompleted()) {
@@ -368,8 +403,10 @@ public class FunctionService {
             return Response.err("Function address is required");
         }
 
-        final StringBuilder resultMsg = new StringBuilder();
         final AtomicBoolean success = new AtomicBoolean(false);
+        final AtomicReference<String> errorMessage = new AtomicReference<>();
+        final AtomicReference<String> functionName = new AtomicReference<>();
+        final AtomicReference<String> decompiledCode = new AtomicReference<>();
 
         // Resolve address before entering threading lambda
         Address addr = ServiceUtils.parseAddress(program, functionAddrStr);
@@ -380,13 +417,12 @@ public class FunctionService {
                 try {
                     Function func = program.getFunctionManager().getFunctionAt(addr);
                     if (func == null) {
-                        resultMsg.append("Error: No function found at address ").append(functionAddrStr);
+                        errorMessage.set("No function found at address " + functionAddrStr);
                         return null;
                     }
 
                     // Create new decompiler interface
-                    DecompInterface decompiler = new DecompInterface();
-                    decompiler.openProgram(program);
+                    DecompInterface decompiler = ServiceUtils.createConfiguredDecompiler(program);
 
                     try {
                         // Flush cached results to force fresh decompilation
@@ -395,31 +431,27 @@ public class FunctionService {
 
                         if (results == null || !results.decompileCompleted()) {
                             String errorMsg = results != null ? results.getErrorMessage() : "Unknown error";
-                            resultMsg.append("Error: Decompilation did not complete for function ").append(func.getName());
+                            String message = "Decompilation did not complete for function " + func.getName();
                             if (errorMsg != null && !errorMsg.isEmpty()) {
-                                resultMsg.append(". Reason: ").append(errorMsg);
+                                message += ". Reason: " + errorMsg;
                             }
+                            errorMessage.set(message);
                             return null;
                         }
 
                         // Check if decompiled function is null (can happen even when decompileCompleted returns true)
                         if (results.getDecompiledFunction() == null) {
-                            resultMsg.append("Error: Decompiler completed but returned null decompiled function for ").append(func.getName()).append(".\n");
-                            resultMsg.append("This can happen with functions that have:\n");
-                            resultMsg.append("- Invalid control flow or unreachable code\n");
-                            resultMsg.append("- Large NOP sleds or padding\n");
-                            resultMsg.append("- External calls to unknown addresses\n");
-                            resultMsg.append("- Stack frame issues\n");
-                            resultMsg.append("Consider using get_disassembly() instead for this function.");
+                            errorMessage.set("Decompiler completed but returned null decompiled function for "
+                                    + func.getName() + ". This can happen with functions that have: "
+                                    + "invalid control flow or unreachable code; large NOP sleds or padding; "
+                                    + "external calls to unknown addresses; stack frame issues. "
+                                    + "Consider using disassemble_function() instead for this function.");
                             return null;
                         }
 
-                        // Get the decompiled C code
-                        String decompiledCode = results.getDecompiledFunction().getC();
-
+                        functionName.set(func.getName());
+                        decompiledCode.set(results.getDecompiledFunction().getC());
                         success.set(true);
-                        resultMsg.append("Success: Forced redecompilation of ").append(func.getName()).append("\n\n");
-                        resultMsg.append(decompiledCode);
 
                         Msg.info(this, "Forced decompilation for function: " + func.getName());
 
@@ -429,22 +461,26 @@ public class FunctionService {
 
                 } catch (Throwable e) {
                     String msg = e.getMessage() != null ? e.getMessage() : e.toString();
-                    resultMsg.append("Error: ").append(msg);
+                    errorMessage.set(msg);
                     Msg.error(this, "Error forcing decompilation", e);
                 }
                 return null;
             });
         } catch (Throwable e) {
             String msg = e.getMessage() != null ? e.getMessage() : e.toString();
-            resultMsg.append("Error: Failed to execute on Swing thread: ").append(msg);
+            errorMessage.set("Failed to execute on Swing thread: " + msg);
             Msg.error(this, "Failed to execute force decompile on Swing thread", e);
         }
 
-        String text = resultMsg.length() > 0 ? resultMsg.toString() : "Error: Unknown failure";
-        if (text.startsWith("Error:")) {
-            return Response.err(text.substring(7).trim());
+        if (!success.get()) {
+            return Response.err(errorMessage.get() != null ? errorMessage.get() : "Unknown failure");
         }
-        return Response.text(text);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("status", "success");
+        out.put("address", functionAddrStr);
+        out.put("name", functionName.get());
+        out.put("decompiled", decompiledCode.get());
+        return Response.ok(out);
     }
 
     public Response forceDecompile(String functionAddrStr) {
@@ -484,6 +520,7 @@ public class FunctionService {
             Address start = func.getEntryPoint();
             Address end = func.getBody().getMaxAddress();
 
+            List<Map<String, Object>> instructions_out = new ArrayList<>();
             InstructionIterator instructions = listing.getInstructions(start, true);
             while (instructions.hasNext()) {
                 Instruction instr = instructions.next();
@@ -491,15 +528,17 @@ public class FunctionService {
                     break; // Stop if we've gone past the end of the function
                 }
                 String comment = listing.getComment(CodeUnit.EOL_COMMENT, instr.getAddress());
-                comment = (comment != null) ? "; " + comment : "";
 
-                sb.append(String.format("%s: %s %s\n",
-                    instr.getAddress(),
-                    instr.toString(),
-                    comment));
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("address", instr.getAddress().toString(false));
+                entry.put("instruction", instr.toString());
+                if (comment != null && !comment.isEmpty()) {
+                    entry.put("comment", comment);
+                }
+                instructions_out.add(entry);
             }
 
-            return Response.text(sb.toString());
+            return ServiceUtils.listed("instructions", instructions_out);
         } catch (Exception e) {
             return Response.err("Error disassembling function: " + e.getMessage());
         }
@@ -529,21 +568,24 @@ public class FunctionService {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
-        if (addressStr == null || addressStr.isEmpty()) return Response.text("Address or function name is required");
+        if (addressStr == null || addressStr.isEmpty()) {
+            return Response.err("Address or function name is required");
+        }
 
         try {
             Function func = ServiceUtils.resolveFunction(program, addressStr);
-            if (func == null) return Response.text("No function found for " + addressStr);
+            if (func == null) return Response.err("No function found for " + addressStr);
 
-            return Response.text(String.format("Function: %s at %s\nSignature: %s\nEntry: %s\nBody: %s - %s",
-                func.getName(),
-                func.getEntryPoint(),
-                func.getSignature(),
-                func.getEntryPoint(),
-                func.getBody().getMinAddress(),
-                func.getBody().getMaxAddress()));
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("name", func.getName());
+            out.put("address", func.getEntryPoint().toString(false));
+            out.put("signature", func.getSignature().getPrototypeString());
+            out.put("entry_point", func.getEntryPoint().toString(false));
+            out.put("body_start", func.getBody().getMinAddress().toString(false));
+            out.put("body_end", func.getBody().getMaxAddress().toString(false));
+            return Response.ok(out);
         } catch (Exception e) {
-            return Response.text("Error getting function: " + e.getMessage());
+            return Response.err("Error getting function: " + e.getMessage());
         }
     }
 
@@ -557,87 +599,15 @@ public class FunctionService {
     // ========================================================================
 
     /**
-     * Rename a function by its name.
-     */
-    @McpTool(path = "/rename_function", method = "POST", description = "Rename function by old and new name", category = "function")
-    public Response renameFunction(
-            @Param(value = "oldName", source = ParamSource.BODY) String oldName,
-            @Param(value = "newName", source = ParamSource.BODY) String newName,
-            @Param(value = "program", defaultValue = "") String programName) {
-        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
-        if (pe.hasError()) return pe.error();
-        Program program = pe.program();
-
-        if (oldName == null || oldName.isEmpty()) {
-            return Response.err("Old function name is required");
-        }
-
-        if (newName == null || newName.isEmpty()) {
-            return Response.err("New function name is required");
-        }
-
-        final StringBuilder resultMsg = new StringBuilder();
-        final AtomicBoolean successFlag = new AtomicBoolean(false);
-
-        try {
-            threadingStrategy.executeWrite(program, "Rename function via HTTP", () -> {
-                boolean found = false;
-                for (Function func : program.getFunctionManager().getFunctions(true)) {
-                    if (func.getName().equals(oldName)) {
-                        found = true;
-                        func.setName(newName, SourceType.USER_DEFINED);
-                        successFlag.set(true);
-                        resultMsg.append("Success: Renamed function '").append(oldName)
-                                .append("' to '").append(newName).append("'");
-                        break;
-                    }
-                }
-
-                if (!found) {
-                    resultMsg.append("Error: Function '").append(oldName).append("' not found");
-                }
-                return null;
-            });
-
-            // Force event processing to ensure changes propagate
-            if (successFlag.get()) {
-                program.flushEvents();
-                try {
-                    Thread.sleep(50);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-        } catch (Exception e) {
-            resultMsg.append("Error: Failed to execute rename on Swing thread: ").append(e.getMessage());
-            Msg.error(this, "Failed to execute rename on Swing thread", e);
-        }
-
-        String text = resultMsg.length() > 0 ? resultMsg.toString() : "Error: Unknown failure";
-        if (successFlag.get()) {
-            List<String> nameWarnings = NamingConventions.validateFunctionName(newName, false);
-            if (nameWarnings.isEmpty()) {
-                return Response.ok(JsonHelper.mapOf("status", "success", "message", text));
-            } else {
-                return Response.ok(JsonHelper.mapOf("status", "success", "message", text, "warnings", nameWarnings));
-            }
-        }
-        return Response.err(text.startsWith("Error: ") ? text.substring(7) : text);
-    }
-
-    public Response renameFunction(String oldName, String newName) {
-        return renameFunction(oldName, newName, null);
-    }
-
-    /**
      * Rename a variable in a function.
      */
-    @McpTool(path = "/rename_variable", method = "POST", description = "Rename a variable in a function. Accepts functionName or function_address; address is more stable after recent renames.", category = "function")
+    // rename_variable merged into rename_variables in 7.0.0; kept as an internal helper
+    // (still used by the headless dispatcher). Callers pass variable_renames=[{old,new}].
     public Response renameVariableInFunction(
-            @Param(value = "functionName", source = ParamSource.BODY, defaultValue = "") String functionName,
+            @Param(value = "function_name", source = ParamSource.BODY, aliases = {"functionName"}, defaultValue = "") String functionName,
             @Param(value = "function_address", paramType = "address", source = ParamSource.BODY, defaultValue = "") String functionAddress,
-            @Param(value = "oldName", source = ParamSource.BODY) String oldVarName,
-            @Param(value = "newName", source = ParamSource.BODY) String newVarName,
+            @Param(value = "old_variable_name", source = ParamSource.BODY, aliases = {"oldName"}) String oldVarName,
+            @Param(value = "new_variable_name", source = ParamSource.BODY, aliases = {"newName"}) String newVarName,
             @Param(value = "program", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
@@ -647,10 +617,8 @@ public class FunctionService {
             return Response.err("Function name or address is required");
         }
 
-        DecompInterface decomp = new DecompInterface();
+        DecompInterface decomp = ServiceUtils.createConfiguredDecompiler(program);
         try {
-            decomp.openProgram(program);
-
             String functionRef = (functionAddress != null && !functionAddress.isEmpty()) ? functionAddress : functionName;
             Function func = ServiceUtils.resolveFunction(program, functionRef);
             if (func == null) {
@@ -718,7 +686,7 @@ public class FunctionService {
                 if (hungarianWarning != null) {
                     return Response.ok(JsonHelper.mapOf("status", "success", "message", "Variable renamed", "warnings", List.of(hungarianWarning)));
                 }
-                return Response.text("Variable renamed");
+                return Response.success("Variable renamed");
             }
         } catch (Exception e) {
             String errorMsg = "Failed to execute rename on Swing thread: " + e.getMessage();
@@ -727,7 +695,7 @@ public class FunctionService {
         } finally {
             decomp.dispose();
         }
-        return Response.text("Failed to rename variable");
+        return Response.err("Failed to rename variable");
     }
 
     public Response renameVariableInFunction(String functionName, String oldVarName, String newVarName) {
@@ -777,14 +745,13 @@ public class FunctionService {
     /**
      * Rename a function by its address.
      */
-    @McpTool(path = "/rename_function_by_address", method = "POST", description = "Rename function at specific address. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
+    @McpTool(path = "/rename_function", method = "POST", description = "Rename a function identified by name OR address. Runs the full naming-quality gate (verb-tier specificity + token-subset collision) with an optional strict_mode override. Replaces rename_function_by_address.", category = "function")
     public Response renameFunctionByAddress(
-            @Param(value = "function_address", paramType = "address", source = ParamSource.BODY,
-                   description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
-                               + "(e.g., mem:1000, code:ff00). Note: some programs — particularly "
-                               + "embedded/microcontroller targets — are not address-space-agnostic; "
-                               + "use get_address_spaces to discover spaces before assuming a plain hex "
-                               + "address is unambiguous.") String functionAddrStr,
+            @Param(value = "old_name", source = ParamSource.BODY,
+                   aliases = {"function_address", "function", "oldName"},
+                   description = "Function name or address to rename. Address accepts 0x<hex> or "
+                               + "<space>:<hex> (e.g., mem:1000, code:ff00); a plain name resolves by exact "
+                               + "function name.") String functionAddrStr,
             @Param(value = "new_name", source = ParamSource.BODY) String newName,
             @Param(value = "program", defaultValue = "") String programName,
             @Param(value = "strict_mode", source = ParamSource.BODY, defaultValue = "",
@@ -849,6 +816,17 @@ public class FunctionService {
                 }
                 enforcementWarnings.add(disabledEnforcementWarning(rejection));
             }
+            // ---- Function ID gate --------------------------------------
+            // Refuse to bury an authoritative library identification under a
+            // subsystem prefix. See NamingConventions.overridesFidName.
+            String fidName = fidNameAt(program, targetFunc);
+            if (NamingConventions.overridesFidName(newName, fidName)) {
+                Map<String, Object> rejection = fidOverrideRejection(newName, fidName);
+                if (enforceStrictNaming) {
+                    return Response.ok(rejection);
+                }
+                enforcementWarnings.add(disabledEnforcementWarning(rejection));
+            }
         }
 
         final StringBuilder resultMsg = new StringBuilder();
@@ -898,6 +876,50 @@ public class FunctionService {
         return renameFunctionByAddress(functionAddrStr, newName, null, null);
     }
 
+    /**
+     * The library name Ghidra's Function ID analyzer recorded for this
+     * function, or null if it never matched one.
+     *
+     * Read from the analysis BOOKMARK rather than the symbol, deliberately: the
+     * bookmark survives a rename, so it still answers "what is this really?"
+     * long after somebody has overwritten the name. That property is what makes
+     * the contamination detectable at all.
+     */
+    private static String fidNameAt(Program program, Function function) {
+        if (program == null || function == null) return null;
+        try {
+            for (Bookmark b : program.getBookmarkManager()
+                    .getBookmarks(function.getEntryPoint())) {
+                if (NamingConventions.FID_BOOKMARK_CATEGORY.equals(b.getCategory())) {
+                    return NamingConventions.extractFidName(b.getComment());
+                }
+            }
+        } catch (Exception e) {
+            // A missing bookmark manager must never block a rename.
+            Msg.debug(FunctionService.class, "FID bookmark lookup failed", e);
+        }
+        return null;
+    }
+
+    private static Map<String, Object> fidOverrideRejection(
+            String rejectedName, String fidName) {
+        return JsonHelper.mapOf(
+                "status", "rejected",
+                "error", "fid_override",
+                "issue", "overrides_function_id",
+                "rejected_name", rejectedName,
+                "fid_name", fidName,
+                "message", "Ghidra's Function ID analyzer identified this function as the "
+                        + "library routine '" + fidName + "'. Renaming it to '" + rejectedName
+                        + "' buries that identification under a subsystem prefix, and because "
+                        + "names propagate across binaries by function hash, statically-linked "
+                        + "library code mislabelled once spreads corpus-wide.",
+                "suggestion", "Keep '" + fidName + "'. If a more readable form is wanted, add it "
+                        + "as a secondary label instead of replacing the primary name. Pass "
+                        + "strict_mode=warn to override deliberately."
+        );
+    }
+
     private static Map<String, Object> nameQualityRejection(
             String rejectedName, NamingConventions.NameQualityResult quality) {
         return JsonHelper.mapOf(
@@ -940,6 +962,39 @@ public class FunctionService {
     // ========================================================================
 
     /**
+     * Extract the function-level calling convention (the token between the return type and
+     * the function name) from a C prototype string.
+     *
+     * <p>Only the substring <em>before</em> the first {@code '('} is scanned so that
+     * conventions embedded inside callback parameter types — e.g. the {@code __cdecl} in
+     * {@code int __stdcall Foo(void (__cdecl *cb)(int))} — are left intact in the cleaned
+     * prototype.
+     *
+     * @param prototype the raw C prototype string (may be empty or {@code null}-safe)
+     * @return a two-element array {@code {convention, cleanedPrototype}} where
+     *         {@code convention} is the matched keyword or {@code ""} if none was found,
+     *         and {@code cleanedPrototype} has that single occurrence removed and whitespace
+     *         normalised.
+     */
+    public static String[] extractCallingConvention(String prototype) {
+        if (prototype == null || prototype.isEmpty()) {
+            return new String[]{"", prototype == null ? "" : prototype};
+        }
+        // Only look at the part before the first '(' so callback-param conventions survive.
+        int paren = prototype.indexOf('(');
+        String head = paren >= 0 ? prototype.substring(0, paren) : prototype;
+        Matcher m = CALLING_CONV_PATTERN.matcher(head);
+        if (!m.find()) {
+            return new String[]{"", prototype};
+        }
+        String cc = m.group(1);
+        // Remove only this single occurrence from the head; leave the parameter list alone.
+        String cleanedHead = head.substring(0, m.start()) + head.substring(m.end());
+        String cleaned = paren >= 0 ? cleanedHead + prototype.substring(paren) : cleanedHead;
+        return new String[]{cc, cleaned.replaceAll("\\s+", " ").trim()};
+    }
+
+    /**
      * Set a function's prototype with proper error handling using ApplyFunctionSignatureCmd.
      */
     public PrototypeResult setFunctionPrototype(String functionAddrStr, String prototype) {
@@ -968,20 +1023,15 @@ public class FunctionService {
             return new PrototypeResult(false, "Function prototype is required");
         }
 
-        // v3.0.1: Extract inline calling convention from prototype string if present
+        // v3.0.1 / v5.13.x: Extract inline calling convention from prototype string if present.
         // Handles cases like "void __cdecl MyFunc(int x)" -> prototype="void MyFunc(int x)", cc="__cdecl"
-        String cleanPrototype = prototype;
-        String resolvedConvention = callingConvention;
-        String[] knownConventions = {"__cdecl", "__stdcall", "__thiscall", "__fastcall", "__vectorcall"};
-        for (String cc : knownConventions) {
-            if (cleanPrototype.contains(cc)) {
-                cleanPrototype = cleanPrototype.replace(cc, "").replaceAll("\\s+", " ").trim();
-                if (resolvedConvention == null || resolvedConvention.isEmpty()) {
-                    resolvedConvention = cc;
-                }
-                Msg.info(this, "Extracted calling convention '" + cc + "' from prototype string");
-                break;
-            }
+        // The helper only scans before the first '(' so conventions inside callback param types survive.
+        String[] ccResult = extractCallingConvention(prototype);
+        String cleanPrototype = ccResult[1];
+        String resolvedConvention = (callingConvention != null && !callingConvention.isEmpty())
+                ? callingConvention : ccResult[0];
+        if (!ccResult[0].isEmpty()) {
+            Msg.info(this, "Extracted calling convention '" + ccResult[0] + "' from prototype string");
         }
         final String finalPrototype = cleanPrototype;
         final String finalConvention = resolvedConvention;
@@ -1006,7 +1056,7 @@ public class FunctionService {
     /**
      * Endpoint wrapper for setFunctionPrototype that converts PrototypeResult to Response.
      */
-    @McpTool(path = "/set_function_prototype", method = "POST", description = "Set function prototype (return type, parameter types, calling convention) by address. NOTE: the function name in the prototype string is used only for parsing — it does NOT rename the function. To rename, call rename_function_by_address separately. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
+    @McpTool(path = "/set_function_prototype", method = "POST", description = "Set function prototype (return type, parameter types, calling convention) by address. NOTE: the function name in the prototype string is used only for parsing — it does NOT rename the function. To rename, call rename_function separately. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
     public Response setFunctionPrototypeEndpoint(
             @Param(value = "function_address", paramType = "address", source = ParamSource.BODY,
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -1019,24 +1069,33 @@ public class FunctionService {
             @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
         PrototypeResult result = setFunctionPrototype(functionAddress, prototype, callingConvention, programName);
         if (result.isSuccess()) {
-            String msg = "Successfully set prototype for function at " + functionAddress;
-            if (callingConvention != null && !callingConvention.isEmpty()) {
-                msg += " with " + callingConvention + " calling convention";
-            }
+            List<String> warnings = new ArrayList<>();
             // Warn about __thiscall ECX auto-param limitation
             String cc = callingConvention != null ? callingConvention : "";
             boolean protoHasThiscall = prototype != null && (prototype.contains("__thiscall") || cc.contains("__thiscall"));
             if (protoHasThiscall && prototype != null && !prototype.contains("void *this") && !prototype.contains("void * this")) {
-                msg += "\n\nWARNING: __thiscall ECX auto-parameter 'this' cannot be retyped via API. "
-                     + "Ghidra accepts the prototype but the decompiler will still show 'this' as void*. "
-                     + "Document the intended type in the plate comment Parameters section instead.";
+                warnings.add("For __thiscall/__fastcall member functions, also call set_function_this_type "
+                     + "with the concrete struct/class pointer (e.g. MyWidget *) so the decompiler "
+                     + "uses typed 'this' field access instead of void*.");
             }
             if (!result.getErrorMessage().isEmpty()) {
-                msg += "\n\nWarnings/Debug Info:\n" + result.getErrorMessage();
+                for (String line : result.getErrorMessage().split("\n")) {
+                    if (!line.isBlank()) warnings.add(line.trim());
+                }
             }
-            return Response.text(msg);
+
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "success");
+            out.put("message", "Successfully set prototype for function at " + functionAddress);
+            out.put("address", functionAddress);
+            out.put("prototype", prototype);
+            if (callingConvention != null && !callingConvention.isEmpty()) {
+                out.put("calling_convention", callingConvention);
+            }
+            if (!warnings.isEmpty()) out.put("warnings", warnings);
+            return Response.ok(out);
         } else {
-            return Response.text("Failed to set function prototype: " + result.getErrorMessage());
+            return Response.err("Failed to set function prototype: " + result.getErrorMessage());
         }
     }
 
@@ -1234,9 +1293,60 @@ public class FunctionService {
     // ========================================================================
 
     /**
+     * Build the decompiler-default-name guidance appended to a "variable not found"
+     * error from set_variable_type. Pure function of the requested name and the
+     * current high-symbol names, so it is unit-testable without a live decompile.
+     *
+     * <p>Ghidra default names follow {@code <prefix>Var<digits>} (uVar1, puVar3, iVar5,
+     * psVar7, ...). When such a name misses, there are two recoverable causes:
+     * <ul>
+     *   <li><b>SSA-renumber drift</b> — same-prefix default names still exist but with
+     *       different digits, because a previous set_variable_type call re-decompiled
+     *       and renumbered the temporaries. Fix: batch with set_variables.</li>
+     *   <li><b>Renamed-away / register-resident</b> — no default-named variables remain at
+     *       all (they were renamed, or the function is register/SIMD-heavy so Ghidra names
+     *       them local_&lt;REG&gt;_*). The caller is working from a stale decompilation. Fix:
+     *       re-decompile for current names, or batch with set_variables.</li>
+     * </ul>
+     *
+     * @return the hint sentence (with trailing space), or "" when no hint applies.
+     */
+    public static String buildVariableNameHint(String variableName, List<String> availableNames) {
+        if (variableName == null || !variableName.matches("^[a-z]+Var\\d+$")) {
+            return "";
+        }
+        if (availableNames == null) {
+            availableNames = java.util.Collections.emptyList();
+        }
+        String prefix = variableName.replaceAll("\\d+$", "");
+        boolean hasSamePrefix = availableNames.stream()
+                .anyMatch(n -> n != null && n.startsWith(prefix) && n.matches("^[a-z]+Var\\d+$"));
+        if (hasSamePrefix) {
+            return "Hint: this looks like SSA-renumber drift from a previous "
+                    + "set_variable_type call in the same function. "
+                    + "Use set_variables for ALL variable type+rename changes in one "
+                    + "atomic call to avoid this — individual set_variable_type "
+                    + "calls trigger re-decompilation that renumbers SSA temporaries. ";
+        }
+        boolean hasAnyDefaultName = availableNames.stream()
+                .anyMatch(n -> n != null && n.matches("^[a-z]+Var\\d+$"));
+        if (!hasAnyDefaultName) {
+            return "Hint: '" + variableName + "' is a Ghidra decompiler default name, but no "
+                    + "default-named (uVarN/iVarN/puVarN) variables remain in this function — "
+                    + "they have been renamed already, or the variables are register-resident "
+                    + "(e.g. local_ESI_*, local_MM*) in a register/SIMD-heavy function. You are "
+                    + "likely working from a stale decompilation: re-decompile to read the current "
+                    + "names from the Available list above, then retype — or use set_variables to "
+                    + "rename+retype in one atomic call. ";
+        }
+        return "";
+    }
+
+    /**
      * Set a local variable's type using HighFunctionDBUtil.updateDBVariable.
      */
-    @McpTool(path = "/set_local_variable_type", method = "POST", description = "Set the data type of a local variable. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
+    // set_local_variable_type merged into set_variable_type in 7.0.0; kept as the shared impl
+    // that set_variable_type (and set_variable_type) delegate to.
     public Response setLocalVariableType(
             @Param(value = "function_address", paramType = "address", source = ParamSource.BODY,
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -1244,8 +1354,8 @@ public class FunctionService {
                                + "embedded/microcontroller targets — are not address-space-agnostic; "
                                + "use get_address_spaces to discover spaces before assuming a plain hex "
                                + "address is unambiguous.") String functionAddrStr,
-            @Param(value = "variable_name", source = ParamSource.BODY) String variableName,
-            @Param(value = "new_type", source = ParamSource.BODY) String newType,
+            @Param(value = "variable_name", source = ParamSource.BODY, aliases = {"variableName"}) String variableName,
+            @Param(value = "new_type", source = ParamSource.BODY, aliases = {"newType"}) String newType,
             @Param(value = "program", defaultValue = "") String programName) {
         // Input validation
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
@@ -1319,27 +1429,10 @@ public class FunctionService {
                                     .append(". ");
                         }
 
-                        // SSA churn hint: when the failed name follows the
-                        // <prefix><digit>+ pattern of a Ghidra SSA temporary
-                        // (iVar5, psVar7, puVar2, ...) and there is a similar
-                        // name in the available list with a *different* digit,
-                        // the most likely cause is that a previous
-                        // set_local_variable_type call retyped a variable in
-                        // the same function and re-decompilation renumbered
-                        // SSA temporaries. Recommend the atomic batch tool
-                        // explicitly rather than leaving the worker to guess.
-                        if (variableName.matches("^[a-z]+Var\\d+$")) {
-                            String prefix = variableName.replaceAll("\\d+$", "");
-                            boolean hasSamePrefix = availableNames.stream()
-                                    .anyMatch(n -> n.startsWith(prefix) && n.matches("^[a-z]+Var\\d+$"));
-                            if (hasSamePrefix) {
-                                resultMsg.append("Hint: this looks like SSA-renumber drift from a previous ")
-                                        .append("set_local_variable_type call in the same function. ")
-                                        .append("Use set_variables for ALL variable type+rename changes in one ")
-                                        .append("atomic call to avoid this — individual set_local_variable_type ")
-                                        .append("calls trigger re-decompilation that renumbers SSA temporaries. ");
-                            }
-                        }
+                        // Decompiler-default-name guidance (SSA churn / renamed-away /
+                        // register-resident). Pure function of the requested name + the
+                        // available high-symbol names — see buildVariableNameHint.
+                        resultMsg.append(buildVariableNameHint(variableName, availableNames));
 
                         // Check if variable exists in low-level API but not high-level (phantom variable)
                         Variable[] lowLevelVars = func.getLocalVariables();
@@ -1383,7 +1476,7 @@ public class FunctionService {
                             if (!baseTypeName.isEmpty() && !baseTypeName.equals("void")) {
                                 resultMsg.append(". Hint: struct '").append(baseTypeName)
                                     .append("' does not exist. Create it first with create_struct(name=\"")
-                                    .append(baseTypeName).append("\", fields=[...]), then retry set_local_variable_type.");
+                                    .append(baseTypeName).append("\", fields=[...]), then retry set_variable_type.");
                             }
                         }
                         return null;
@@ -1442,9 +1535,9 @@ public class FunctionService {
     }
 
     /**
-     * Endpoint wrapper for set_parameter_type (delegates to setLocalVariableType).
+     * Parameter-typing entry point (delegates to setLocalVariableType).
      */
-    @McpTool(path = "/set_parameter_type", method = "POST", description = "Set the data type of a function parameter. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "function")
+    // set_parameter_type merged into set_variable_type in 7.0.0; kept as an internal helper.
     public Response setParameterTypeEndpoint(
             @Param(value = "function_address", paramType = "address", source = ParamSource.BODY,
                    description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
@@ -1452,10 +1545,269 @@ public class FunctionService {
                                + "embedded/microcontroller targets — are not address-space-agnostic; "
                                + "use get_address_spaces to discover spaces before assuming a plain hex "
                                + "address is unambiguous.") String functionAddress,
-            @Param(value = "parameter_name", source = ParamSource.BODY) String parameterName,
-            @Param(value = "new_type", source = ParamSource.BODY) String newType,
+            @Param(value = "parameter_name", source = ParamSource.BODY, aliases = {"parameterName"}) String parameterName,
+            @Param(value = "new_type", source = ParamSource.BODY, aliases = {"newType"}) String newType,
             @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+        if ("this".equals(parameterName)) {
+            return setFunctionThisType(functionAddress, newType, programName);
+        }
         return setLocalVariableType(functionAddress, parameterName, newType, programName);
+    }
+
+    /**
+     * Retype the implicit {@code this} pointer for {@code __thiscall} / {@code __fastcall} member
+     * functions so decompilation shows {@code this->field} with the correct struct/class type.
+     */
+    @McpTool(path = "/set_function_this_type", method = "POST",
+            description = "Type the implicit 'this' of a __thiscall/__fastcall member function by associating the function with its class. Ghidra's auto-'this' (ECX on x86) is an immutable auto-parameter; with auto-storage it derives its type from the function's parent Class namespace, matched by name to a same-named structure. This tool finds/creates a class namespace for the struct and moves the function into it (no custom storage). Pass 'MyClass *' or 'MyClass'; the structure MyClass must already exist (create_struct). On programs with multiple address spaces, prefix function_address with the space name (mem:1000).",
+            category = "function")
+    public Response setFunctionThisType(
+            @Param(value = "function_address", paramType = "address", source = ParamSource.BODY,
+                   description = "Function entry address (0x<hex> or <space>:<hex>).") String functionAddrStr,
+            @Param(value = "this_type", source = ParamSource.BODY, aliases = {"thisType"},
+                   description = "Class type for this, e.g. 'MyWidget *' or 'MyWidget'. The base struct name becomes the function's class.") String thisType,
+            @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+
+        if (functionAddrStr == null || functionAddrStr.isEmpty()) {
+            return Response.err("Function address is required");
+        }
+        if (thisType == null || thisType.isEmpty()) {
+            return Response.err("this_type is required");
+        }
+        if (thisType.startsWith("undefined")) {
+            return Response.err("Rejected: this_type must be a concrete struct/class pointer, not " + thisType);
+        }
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        Address addr = ServiceUtils.parseAddress(program, functionAddrStr);
+        if (addr == null) return Response.err(ServiceUtils.getLastParseError());
+
+        final StringBuilder resultMsg = new StringBuilder();
+        final AtomicBoolean success = new AtomicBoolean(false);
+
+        try {
+            threadingStrategy.executeWrite(program, "Associate function with class for 'this'", () -> {
+                Function func = ServiceUtils.getFunctionForAddress(program, addr);
+                if (func == null) {
+                    resultMsg.append("Error: No function found at ").append(functionAddrStr);
+                    return null;
+                }
+
+                // The this_type names the owning class. Its base must be an existing structure,
+                // because Ghidra derives the auto-'this' type from a class namespace that is
+                // associated by name with a same-named struct.
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType pointerType = resolveThisPointerType(dtm, thisType);
+                if (!(pointerType instanceof Pointer)) {
+                    resultMsg.append("Error: Could not resolve this_type '").append(thisType)
+                            .append("' to a pointer. Create the structure first with create_struct, then retry.");
+                    return null;
+                }
+                DataType base = ((Pointer) pointerType).getDataType();
+                if (!(base instanceof Structure)) {
+                    resultMsg.append("Error: 'this' must point to a structure/class type; '")
+                            .append(base != null ? base.getName() : "void")
+                            .append("' is not a structure. Ghidra derives the 'this' type from a same-named struct.");
+                    return null;
+                }
+                String className = base.getName();
+
+                // The member function must already have an implicit 'this'; that only exists for a
+                // hasThis convention (__thiscall/__fastcall). Bail out before mutating anything so
+                // non-member functions are not silently re-parented into a class.
+                Parameter thisParam = findAutoThisParameter(func);
+                if (thisParam == null) {
+                    String cc;
+                    try {
+                        cc = func.getCallingConventionName();
+                    } catch (Exception ignored) {
+                        cc = "";
+                    }
+                    resultMsg.append("Error: ").append(func.getName())
+                            .append(" has no implicit 'this' parameter (calling convention '")
+                            .append(cc == null || cc.isEmpty() ? "(default)" : cc)
+                            .append("'). Set it to __thiscall with set_function_prototype, then retry.");
+                    return null;
+                }
+
+                // Auto-parameters are immutable via the API; the 'this' auto-parameter instead
+                // obtains its type from the function's parent Class namespace (auto-storage). So we
+                // place the function in a GhidraClass named after the struct rather than retyping
+                // 'this' directly. This is the same model as the decompiler's "Auto Fill in Class
+                // Structure" / re-parenting via the Symbol Tree — no custom storage required.
+                SymbolTable st = program.getSymbolTable();
+                Namespace global = program.getGlobalNamespace();
+                GhidraClass classNs;
+                Namespace existing = st.getNamespace(className, global);
+                if (existing == null) {
+                    classNs = st.createClass(global, className, SourceType.USER_DEFINED);
+                } else if (existing instanceof GhidraClass) {
+                    classNs = (GhidraClass) existing;
+                } else {
+                    classNs = st.convertNamespaceToClass(existing);
+                }
+
+                Namespace currentNs = func.getParentNamespace();
+                boolean alreadyInClass = currentNs instanceof GhidraClass
+                        && className.equals(currentNs.getName());
+                if (!alreadyInClass) {
+                    func.getSymbol().setNamespace(classNs);
+                }
+
+                // Re-read the auto-'this' so we report the type Ghidra now derives from the class.
+                thisParam = findAutoThisParameter(func);
+                DataType resolvedThis = thisParam != null ? thisParam.getDataType() : pointerType;
+                String resolvedName = resolvedThis != null ? resolvedThis.getDisplayName() : (className + " *");
+                success.set(true);
+                resultMsg.append(alreadyInClass ? "Confirmed " : "Moved ").append(func.getName())
+                        .append(alreadyInClass ? " in class " : " into class ").append(className)
+                        .append("; 'this' types as ").append(resolvedName)
+                        .append(" (auto-storage). Call get_decompiled_code or force_decompile to refresh output.");
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("set_function_this_type failed: " + e.getMessage());
+        }
+
+        if (success.get()) {
+            return Response.ok(JsonHelper.mapOf("status", "success", "message", resultMsg.toString()));
+        }
+        String text = resultMsg.length() > 0 ? resultMsg.toString() : "Failed to set 'this' type";
+        return Response.err(text.startsWith("Error: ") ? text.substring(7) : text);
+    }
+
+    /** Locate the implicit {@code this} (auto-parameter or explicit) on a member function. */
+    static Parameter findAutoThisParameter(Function func) {
+        if (func == null) {
+            return null;
+        }
+        for (Parameter param : func.getParameters()) {
+            if (param.isAutoParameter() && param.getAutoParameterType() == AutoParameterType.THIS) {
+                return param;
+            }
+            if ("this".equals(param.getName())) {
+                return param;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Alias for {@link #setLocalVariableType} — name matches Ghidra UI "Retype Variable".
+     */
+    @McpTool(path = "/set_variable_type", method = "POST",
+            description = "Set the data type of a function variable (local OR parameter) by name at the decompiler (high-level) layer. Pass variable_name='this' to type a __thiscall/__fastcall implicit this. Replaces set_local_variable_type / set_parameter_type / set_decompiler_variable_type.",
+            category = "function")
+    public Response setDecompilerVariableType(
+            @Param(value = "function_address", paramType = "address", source = ParamSource.BODY) String functionAddress,
+            @Param(value = "variable_name", source = ParamSource.BODY, aliases = {"parameter_name"}) String variableName,
+            @Param(value = "new_type", source = ParamSource.BODY) String newType,
+            @Param(value = "program", defaultValue = "") String programName) {
+        if ("this".equals(variableName)) {
+            return setFunctionThisType(functionAddress, newType, programName);
+        }
+        return setLocalVariableType(functionAddress, variableName, newType, programName);
+    }
+
+    static DataType resolveThisPointerType(DataTypeManager dtm, String thisType) {
+        if (dtm == null) {
+            return null;
+        }
+        String normalized = thisType.trim();
+        if (normalized.isEmpty()) {
+            return null;
+        }
+        if (!normalized.contains("*")) {
+            normalized = normalized + " *";
+        }
+        return ServiceUtils.resolveDataType(dtm, normalized);
+    }
+
+    @McpTool(path = "/list_class_members", method = "GET",
+            description = "List the member functions of a C++ class. A function counts as a member if it lives in the class's namespace (e.g. after set_function_this_type re-parents it) OR its implicit 'this' parameter types as '<class> *'. Each result reports how it matched (namespace / this_type / both). Replaces the manual 'search __thiscall functions then read each signature' workflow.",
+            category = "function")
+    public Response listClassMembers(
+            @Param(value = "class_name",
+                   description = "Class / struct name, e.g. 'UnitAny'.") String className,
+            @Param(value = "offset", defaultValue = "0") int offset,
+            @Param(value = "limit", defaultValue = "200") int limit,
+            @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+        if (className == null || className.trim().isEmpty()) {
+            return Response.err("class_name is required");
+        }
+        final String cls = className.trim();
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            return threadingStrategy.executeRead(() -> {
+                SymbolTable st = program.getSymbolTable();
+                Namespace global = program.getGlobalNamespace();
+                Namespace classNs = st.getNamespace(cls, global);
+                boolean isGhidraClass = classNs instanceof GhidraClass;
+
+                List<Map<String, Object>> members = new ArrayList<>();
+                for (Function func : program.getFunctionManager().getFunctions(true)) {
+                    // (1) namespace membership: function lives under a non-global namespace
+                    //     named after the class (GhidraClass or plain namespace).
+                    Namespace parent = func.getParentNamespace();
+                    boolean byNamespace = parent != null && !parent.isGlobal()
+                            && cls.equals(parent.getName());
+
+                    // (2) this-type membership: the implicit 'this' points at the class struct.
+                    boolean byThis = false;
+                    String thisTypeName = null;
+                    Parameter thisParam = findAutoThisParameter(func);
+                    if (thisParam != null) {
+                        DataType dt = thisParam.getDataType();
+                        if (dt instanceof Pointer) {
+                            DataType base = ((Pointer) dt).getDataType();
+                            if (base != null && cls.equals(base.getName())) {
+                                byThis = true;
+                                thisTypeName = dt.getDisplayName();
+                            }
+                        }
+                    }
+
+                    if (byNamespace || byThis) {
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("address", func.getEntryPoint().toString(false));
+                        m.put("name", func.getName(true));
+                        m.put("matched_by", (byNamespace && byThis) ? "both"
+                                : byNamespace ? "namespace" : "this_type");
+                        if (thisTypeName != null) m.put("this_type", thisTypeName);
+                        members.add(m);
+                    }
+                }
+
+                int total = members.size();
+                int from = Math.max(0, offset);
+                int pageLimit = Math.max(1, limit);
+                int to = Math.min(total, from + pageLimit);
+                List<Map<String, Object>> page = from < to
+                        ? new ArrayList<>(members.subList(from, to)) : new ArrayList<>();
+
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("class_name", cls);
+                result.put("class_namespace_exists", isGhidraClass);
+                result.put("total_members", total);
+                result.put("offset", from);
+                result.put("limit", pageLimit);
+                result.put("members", page);
+                if (total == 0) {
+                    result.put("note", "No members found. A function matches if it is in the '" + cls
+                            + "' namespace or its 'this' parameter types as '" + cls + " *'. Create the "
+                            + "struct (create_struct) and associate functions with set_function_this_type.");
+                }
+                return Response.ok(result);
+            });
+        } catch (Exception e) {
+            return Response.err("list_class_members failed: " + e.getMessage());
+        }
     }
 
     /**
@@ -1558,6 +1910,50 @@ public class FunctionService {
     // Function attribute methods
     // ========================================================================
 
+    static NoReturnUpdateResult setNoReturnState(Function function, boolean noReturn) {
+        List<Function> chain = new ArrayList<>();
+        Function current = function;
+
+        while (true) {
+            chain.add(current);
+            Function directTarget = current.getThunkedFunction(false);
+            if (directTarget == null) {
+                break;
+            }
+
+            if (current.hasNoReturn() != noReturn) {
+                boolean detached = false;
+                try {
+                    current.setThunkedFunction(null);
+                    detached = true;
+                    current.setNoReturn(noReturn);
+                } finally {
+                    if (detached) {
+                        current.setThunkedFunction(directTarget);
+                    }
+                }
+            }
+
+            current = directTarget;
+        }
+
+        Function terminal = current;
+        terminal.setNoReturn(noReturn);
+
+        for (Function candidate : chain) {
+            boolean actual = candidate.hasNoReturn();
+            if (actual != noReturn) {
+                throw new IllegalStateException(
+                    "No-return state did not persist for function " + candidate.getName()
+                        + ": expected " + noReturn + ", actual " + actual);
+            }
+        }
+
+        return new NoReturnUpdateResult(
+            function.hasNoReturn(),
+            terminal.hasNoReturn());
+    }
+
     /**
      * Set a function's "No Return" attribute.
      *
@@ -1579,7 +1975,7 @@ public class FunctionService {
                                + "embedded/microcontroller targets — are not address-space-agnostic; "
                                + "use get_address_spaces to discover spaces before assuming a plain hex "
                                + "address is unambiguous.") String functionAddrStr,
-            @Param(value = "no_return", source = ParamSource.BODY) boolean noReturn,
+            @Param(value = "no_return", source = ParamSource.BODY, aliases = {"noReturn"}) boolean noReturn,
             @Param(value = "program", defaultValue = "") String programName) {
         // Input validation
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
@@ -1596,6 +1992,7 @@ public class FunctionService {
 
         final StringBuilder resultMsg = new StringBuilder();
         final AtomicBoolean success = new AtomicBoolean(false);
+        final AtomicReference<NoReturnUpdateResult> verifiedResult = new AtomicReference<>();
 
         try {
             threadingStrategy.executeWrite(program, "Set function no return", () -> {
@@ -1608,10 +2005,9 @@ public class FunctionService {
 
                 String oldState = func.hasNoReturn() ? "non-returning" : "returning";
 
-                // Set the no-return attribute
-                func.setNoReturn(noReturn);
-
-                String newState = noReturn ? "non-returning" : "returning";
+                NoReturnUpdateResult verified = setNoReturnState(func, noReturn);
+                String newState = verified.functionNoReturn() ? "non-returning" : "returning";
+                verifiedResult.set(verified);
                 success.set(true);
 
                 resultMsg.append("Success: Set function '").append(func.getName())
@@ -1629,7 +2025,12 @@ public class FunctionService {
 
         String text = resultMsg.length() > 0 ? resultMsg.toString() : "Error: Unknown failure";
         if (success.get()) {
-            return Response.ok(JsonHelper.mapOf("status", "success", "message", text));
+            NoReturnUpdateResult verified = verifiedResult.get();
+            return Response.ok(JsonHelper.mapOf(
+                "status", "success",
+                "message", text,
+                "function_no_return", verified.functionNoReturn(),
+                "terminal_no_return", verified.terminalNoReturn()));
         }
         return Response.err(text.startsWith("Error: ") ? text.substring(7) : text);
     }
@@ -1765,15 +2166,17 @@ public class FunctionService {
         Address addr = ServiceUtils.parseAddress(program, functionAddrStr);
         if (addr == null) return Response.err(ServiceUtils.getLastParseError());
 
-        final StringBuilder resultMsg = new StringBuilder();
         final AtomicBoolean success = new AtomicBoolean(false);
+        final AtomicReference<String> errorMessage = new AtomicReference<>();
+        final AtomicReference<String> functionName = new AtomicReference<>();
+        final AtomicReference<String> oldStorageRef = new AtomicReference<>();
 
         try {
             threadingStrategy.executeWrite(program, "Set variable storage", () -> {
 
                 Function func = program.getFunctionManager().getFunctionAt(addr);
                 if (func == null) {
-                    resultMsg.append("Error: No function found at address ").append(functionAddrStr);
+                    errorMessage.set("No function found at address " + functionAddrStr);
                     return null;
                 }
 
@@ -1787,45 +2190,43 @@ public class FunctionService {
                 }
 
                 if (targetVar == null) {
-                    resultMsg.append("Error: Variable '").append(variableName).append("' not found in function ").append(func.getName());
+                    errorMessage.set("Variable '" + variableName + "' not found in function " + func.getName());
                     return null;
                 }
 
                 String oldStorage = targetVar.getVariableStorage().toString();
+                functionName.set(func.getName());
+                oldStorageRef.set(oldStorage);
 
-                // Ghidra's variable storage API has limited programmatic access
-                // The proper way to change variable storage is through the decompiler UI
-                resultMsg.append("Note: Programmatic variable storage control is limited in Ghidra.\n\n");
-                resultMsg.append("Current variable information:\n");
-                resultMsg.append("  Variable: ").append(variableName).append("\n");
-                resultMsg.append("  Function: ").append(func.getName()).append(" @ ").append(functionAddrStr).append("\n");
-                resultMsg.append("  Current storage: ").append(oldStorage).append("\n");
-                resultMsg.append("  Requested storage: ").append(storageSpec).append("\n\n");
-                resultMsg.append("To change variable storage:\n");
-                resultMsg.append("1. Open the function in Ghidra's Decompiler window\n");
-                resultMsg.append("2. Right-click on the variable '").append(variableName).append("'\n");
-                resultMsg.append("3. Select 'Edit Data Type' or 'Retype Variable'\n");
-                resultMsg.append("4. Manually adjust the storage location\n\n");
-                resultMsg.append("Alternative approach:\n");
-                resultMsg.append("- Use run_script() to execute a custom Ghidra script\n");
-                resultMsg.append("- The script can use high-level Pcode/HighVariable API\n");
-                resultMsg.append("- See FixEBPRegisterReuse.java for an example\n");
-
+                // Ghidra's variable storage API has limited programmatic access;
+                // this call reports the current/requested storage rather than
+                // actually changing it -- see the manual workaround in the
+                // response's "message"/"see_also" fields.
                 success.set(true);
                 Msg.info(this, "Variable storage query for: " + variableName + " in " + func.getName() +
                          " (current: " + oldStorage + ", requested: " + storageSpec + ")");
                 return null;
             });
         } catch (Exception e) {
-            resultMsg.append("Error: Failed to execute on Swing thread: ").append(e.getMessage());
+            errorMessage.set("Failed to execute on Swing thread: " + e.getMessage());
             Msg.error(this, "Failed to execute set variable storage on Swing thread", e);
         }
 
-        String text = resultMsg.length() > 0 ? resultMsg.toString() : "Error: Unknown failure";
-        if (success.get()) {
-            return Response.text(text);
+        if (!success.get()) {
+            return Response.err(errorMessage.get() != null ? errorMessage.get() : "Unknown failure");
         }
-        return Response.err(text.startsWith("Error: ") ? text.substring(7) : text);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("status", "unsupported");
+        out.put("variable", variableName);
+        out.put("function", functionName.get());
+        out.put("address", functionAddrStr);
+        out.put("current_storage", oldStorageRef.get());
+        out.put("requested_storage", storageSpec);
+        out.put("message", "Programmatic variable storage control is limited in Ghidra; use the Decompiler UI "
+                + "(right-click the variable > Edit Data Type/Retype Variable) or run_ghidra_script with the "
+                + "high-level Pcode/HighVariable API.");
+        out.put("see_also", "FixEBPRegisterReuse.java");
+        return Response.ok(out);
     }
 
     public Response setVariableStorage(String functionAddrStr, String variableName, String storageSpec) {
@@ -1844,7 +2245,7 @@ public class FunctionService {
             @Param(value = "function_name", description = "Function name (ignored if address is provided)", defaultValue = "") String functionName,
             @Param(value = "address", description = "Function address (hex, e.g. 6fc583f0). If provided, overrides function_name lookup.", defaultValue = "") String address,
             @Param(value = "program", defaultValue = "") String programName,
-            @Param(value = "limit", description = "Max local variables to return (default 200, 0 = unlimited)", defaultValue = "200") String limitStr,
+            @Param(value = "limit", description = "Max local variables to return (default 200, 0 = unlimited)", defaultValue = "200") int limit,
             @Param(value = "filter", description = "Filter locals: 'all' (default), 'needs_work' (only needs_type or needs_rename), 'named' (only non-generic names)", defaultValue = "all") String filter) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
@@ -1854,7 +2255,6 @@ public class FunctionService {
             return Response.err("Either function_name or address is required");
         }
 
-        final int limit = (limitStr != null && !limitStr.isEmpty()) ? Integer.parseInt(limitStr) : 200;
         final String filterMode = (filter != null && !filter.isEmpty()) ? filter : "all";
 
         final Program finalProgram = program;
@@ -2012,7 +2412,7 @@ public class FunctionService {
 
     // Backward compatibility overload
     public Response getFunctionVariables(String functionName) {
-        return getFunctionVariables(functionName, null, null, null, null);
+        return getFunctionVariables(functionName, null, null, 200, null);
     }
 
     /** Suggest a concrete type for an undefined Ghidra type based on size. */
@@ -2609,6 +3009,290 @@ public class FunctionService {
     }
 
     // ========================================================================
+    // Clear Flow and Repair
+    // ========================================================================
+
+    /** Command failure inside the write transaction; thrown so executeWrite rolls back. */
+    private static final class ClearFlowFailedException extends RuntimeException {
+        ClearFlowFailedException(String message) {
+            super(message);
+        }
+    }
+
+    @McpTool(path = "/clear_flow_and_repair", method = "POST",
+             description = "Run Ghidra's GUI 'Clear Flow and Repair' action on a seed range: clears instruction flow reachable from the seed, then repairs function bodies and re-disassembles retained flow (ClearFlowAndRepairCmd with clear_data=false, clear_labels=false, repair=true). Use to rebuild regions whose flow was created under wrong assumptions, e.g. a function truncated while a callee was incorrectly marked non-returning. The command follows control flow BEYOND the seed range; the reported observations are seed-local only and do not describe everything the command changed. The flow traversal is not cancellable — a very large connected flow can hold the write lock (GUI: the Swing thread) until it completes. Ghidra treats a seed with exactly one candidate flow start (an instruction that is neither a function entry nor reached by fallthrough from inside the seed) as the flow being intentionally removed and does not reseed that start during repair; consequently, applying this action to otherwise healthy flow can clear code, matching the GUI action's behavior. The response's seed_range.end_address_exclusive is null when the seed ends at its address space's maximum address, since that boundary has no representable exclusive successor. Results are reachability-dependent and the command is not idempotent: some damaged regions may require more than one application to rebuild, while applying it again to healthy flow can clear code — inspect the before/after observations and resulting disassembly after every call.",
+             category = "function")
+    public Response clearFlowAndRepair(
+            @Param(value = "start_address", paramType = "address", source = ParamSource.BODY,
+                   description = "Seed start. Accepts 0x<hex> (default space) or <space>:<hex> (e.g., mem:1000). "
+                               + "Use get_address_spaces first on multi-space programs.") String startAddress,
+            @Param(value = "end_address", paramType = "address", source = ParamSource.BODY, defaultValue = "",
+                   description = "Exclusive seed end (consistent with disassemble_bytes). Must be in the same "
+                               + "address space as start_address and strictly greater. Omitted: one-address seed; "
+                               + "the command still follows flow from there like clicking one address in the GUI.") String endAddress,
+            @Param(value = "program", defaultValue = "") String programName) {
+
+        if (startAddress == null || startAddress.isEmpty()) {
+            return Response.err("start_address parameter required");
+        }
+
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        Address start = ServiceUtils.parseAddress(program, startAddress);
+        if (start == null) return Response.err(ServiceUtils.getLastParseError());
+
+        Address seedEnd = start;
+        if (endAddress != null && !endAddress.isEmpty()) {
+            Address end = ServiceUtils.parseAddress(program, endAddress);
+            if (end == null) return Response.err(ServiceUtils.getLastParseError());
+            if (!end.getAddressSpace().equals(start.getAddressSpace())) {
+                return Response.err("end_address must be in the same address space as start_address");
+            }
+            if (end.compareTo(start) <= 0) {
+                return Response.err("end_address must be greater than start_address (end_address is exclusive)");
+            }
+            seedEnd = end.subtract(1);
+        }
+
+        final AddressSet seed = new AddressSet(start, seedEnd);
+
+        // Computed before the transaction: a seed ending at the address-space maximum has no
+        // representable exclusive end.
+        String endExclusive;
+        try {
+            endExclusive = seedEnd.add(1).toString();
+        } catch (AddressOutOfBoundsException e) {
+            endExclusive = null;
+        }
+        final String endExclusiveStr = endExclusive;
+
+        try {
+            Map<String, Object> data = threadingStrategy.executeWrite(program, "Clear Flow and Repair", () -> {
+                Listing listing = program.getListing();
+                long instructionsBefore = countInstructionsIn(listing, seed);
+                List<Map<String, Object>> functionsBefore = snapshotFunctionsOverlapping(program, seed);
+
+                rejectDestructiveNoReturnBoundaries(program, listing, seed);
+                redisassembleStaleNoReturnCalls(program, listing, seed);
+                rejectDestructiveNoReturnBoundaries(program, listing, seed);
+
+                ClearFlowAndRepairCmd cmd = new ClearFlowAndRepairCmd(seed, false, false, true);
+                if (!cmd.applyTo(program, ghidra.util.task.TaskMonitor.DUMMY)) {
+                    String status = cmd.getStatusMsg();
+                    throw new ClearFlowFailedException(status != null && !status.isBlank()
+                            ? status : "Clear Flow and Repair returned false without a status message");
+                }
+                rejectDestructiveNoReturnBoundaries(program, listing, seed);
+
+                long instructionsAfter = countInstructionsIn(listing, seed);
+                List<Map<String, Object>> functionsAfter = snapshotFunctionsOverlapping(program, seed);
+
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("success", true);
+                Map<String, Object> seedRange = new LinkedHashMap<>();
+                seedRange.put("start_address", start.toString());
+                seedRange.put("end_address_exclusive", endExclusiveStr);
+                result.put("seed_range", seedRange);
+                result.put("repair", true);
+                result.put("clear_data", false);
+                result.put("clear_labels", false);
+                Map<String, Object> observations = new LinkedHashMap<>();
+                observations.put("instructions_in_seed_before", instructionsBefore);
+                observations.put("instructions_in_seed_after", instructionsAfter);
+                observations.put("instruction_count_delta_in_seed", instructionsAfter - instructionsBefore);
+                observations.put("functions_intersecting_seed_before", functionsBefore);
+                observations.put("functions_intersecting_seed_after", functionsAfter);
+                observations.put("noreturn_call_boundaries_in_seed",
+                    snapshotUndefinedNoReturnBoundaries(program, listing, seed));
+                result.put("observations", observations);
+                return result;
+            });
+            return Response.ok(data);
+        } catch (ClearFlowFailedException e) {
+            return Response.err(e.getMessage());
+        } catch (Exception e) {
+            return Response.err(e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private static void redisassembleStaleNoReturnCalls(Program program, Listing listing,
+                                                        AddressSetView seed) {
+        List<Address> staleCalls = new ArrayList<>();
+        InstructionIterator instructions = listing.getInstructions(seed, true);
+        while (instructions.hasNext()) {
+            Instruction instruction = instructions.next();
+            if (instruction.getFlowOverride() != FlowOverride.CALL_RETURN ||
+                instruction.isFallThroughOverridden() || !isOriginalCall(instruction)) {
+                continue;
+            }
+
+            Address[] flows = instruction.getFlows();
+            if (flows.length != 1) {
+                continue;
+            }
+            Function target = program.getFunctionManager().getFunctionAt(flows[0]);
+            if (target != null && !calleeStopsFallthrough(program, target)) {
+                staleCalls.add(instruction.getAddress());
+            }
+        }
+
+        for (Address address : staleCalls) {
+            Instruction instruction = listing.getInstructionAt(address);
+            if (instruction == null || instruction.getFlowOverride() != FlowOverride.CALL_RETURN) {
+                continue;
+            }
+
+            listing.clearCodeUnits(address, instruction.getMaxAddress(), false);
+            DisassembleCommand disassemble = new DisassembleCommand(address, seed, true);
+            disassemble.enableCodeAnalysis(false);
+            boolean success = disassemble.applyTo(program, ghidra.util.task.TaskMonitor.DUMMY);
+            Instruction repaired = listing.getInstructionAt(address);
+            if (!success || repaired == null || repaired.getFlowOverride() == FlowOverride.CALL_RETURN) {
+                String status = disassemble.getStatusMsg();
+                throw new ClearFlowFailedException(status != null && !status.isBlank()
+                        ? status : "Failed to re-disassemble stale no-return call at " + address);
+            }
+        }
+    }
+
+    private static void rejectDestructiveNoReturnBoundaries(Program program, Listing listing,
+                                                              AddressSetView seed) {
+        List<Map<String, Object>> boundaries = new ArrayList<>();
+        InstructionIterator instructions = listing.getInstructions(seed, true);
+        while (instructions.hasNext()) {
+            Instruction call = instructions.next();
+            Function target = getDirectCallTarget(program, call);
+            Address next = getSequentialAddress(call);
+            if (target == null || next == null || call.isFallThroughOverridden() ||
+                !calleeStopsFallthrough(program, target) || listing.getInstructionAt(next) == null ||
+                hasIndependentEntry(program, listing, call, next)) {
+                continue;
+            }
+            boundaries.add(snapshotNoReturnBoundary(call, target, next));
+        }
+        if (!boundaries.isEmpty()) {
+            throw new ClearFlowFailedException(
+                "Repair would delete defined continuation after no-return call(s): " + boundaries);
+        }
+    }
+
+    private static List<Map<String, Object>> snapshotUndefinedNoReturnBoundaries(
+            Program program, Listing listing, AddressSetView seed) {
+        List<Map<String, Object>> boundaries = new ArrayList<>();
+        InstructionIterator instructions = listing.getInstructions(seed, true);
+        while (instructions.hasNext()) {
+            Instruction call = instructions.next();
+            Function target = getDirectCallTarget(program, call);
+            Address next = getSequentialAddress(call);
+            if (target != null && next != null && calleeStopsFallthrough(program, target) &&
+                listing.getInstructionAt(next) == null) {
+                boundaries.add(snapshotNoReturnBoundary(call, target, next));
+            }
+        }
+        return boundaries;
+    }
+
+    private static Function getDirectCallTarget(Program program, Instruction instruction) {
+        if (!isOriginalCall(instruction)) {
+            return null;
+        }
+        Address[] flows = instruction.getFlows();
+        if (flows.length != 1) {
+            return null;
+        }
+        return program.getFunctionManager().getFunctionAt(flows[0]);
+    }
+
+    private static boolean isOriginalCall(Instruction instruction) {
+        return instruction.getPrototype().getFlowType(instruction.getInstructionContext()).isCall();
+    }
+
+    private static boolean calleeStopsFallthrough(Program program, Function target) {
+        if (target.hasNoReturn()) {
+            return true;
+        }
+        String callFixup = target.getCallFixup();
+        if (callFixup == null || callFixup.isEmpty()) {
+            return false;
+        }
+        InjectPayload payload = program.getCompilerSpec().getPcodeInjectLibrary()
+            .getPayload(InjectPayload.CALLFIXUP_TYPE, callFixup);
+        return payload != null && !payload.isFallThru();
+    }
+
+    private static Address getSequentialAddress(Instruction instruction) {
+        try {
+            return instruction.getAddress().addNoWrap(instruction.getDefaultFallThroughOffset());
+        }
+        catch (AddressOverflowException e) {
+            return null;
+        }
+    }
+
+    private static boolean hasIndependentEntry(Program program, Listing listing,
+                                                Instruction call, Address next) {
+        Address fallFrom = listing.getInstructionAt(next).getFallFrom();
+        if (fallFrom != null && !fallFrom.equals(call.getAddress())) {
+            return true;
+        }
+        ReferenceIterator references = program.getReferenceManager().getReferencesTo(next);
+        while (references.hasNext()) {
+            Reference reference = references.next();
+            if (reference.getReferenceType().isFlow() &&
+                !reference.getFromAddress().equals(call.getAddress())) {
+                return true;
+            }
+        }
+        if (program.getFunctionManager().getFunctionAt(next) != null ||
+            program.getSymbolTable().isExternalEntryPoint(next)) {
+            return true;
+        }
+        Symbol symbol = program.getSymbolTable().getPrimarySymbol(next);
+        return symbol != null && symbol.getSource() != SourceType.DEFAULT;
+    }
+
+    private static Map<String, Object> snapshotNoReturnBoundary(Instruction call, Function target,
+                                                                 Address next) {
+        Map<String, Object> boundary = new LinkedHashMap<>();
+        boundary.put("call_address", call.getAddress().toString());
+        boundary.put("callee_address", target.getEntryPoint().toString());
+        boundary.put("callee_name", target.getName());
+        boundary.put("callee_is_thunk", target.isThunk());
+        Function thunked = target.getThunkedFunction(false);
+        boundary.put("thunked_function", thunked != null ? thunked.getEntryPoint().toString() : null);
+        boundary.put("next_address", next.toString());
+        return boundary;
+    }
+
+    private static long countInstructionsIn(Listing listing, AddressSetView set) {
+        long count = 0;
+        for (InstructionIterator it = listing.getInstructions(set, true); it.hasNext(); it.next()) {
+            count++;
+        }
+        return count;
+    }
+
+    /** Immutable name/entry snapshots, entry-ascending; Function objects must not outlive the transaction. */
+    private static List<Map<String, Object>> snapshotFunctionsOverlapping(Program program, AddressSetView set) {
+        List<Function> funcs = new ArrayList<>();
+        java.util.Iterator<Function> it = program.getFunctionManager().getFunctionsOverlapping(set);
+        while (it.hasNext()) {
+            funcs.add(it.next());
+        }
+        funcs.sort(java.util.Comparator.comparing(Function::getEntryPoint));
+        List<Map<String, Object>> out = new ArrayList<>(funcs.size());
+        for (Function f : funcs) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("name", f.getName());
+            m.put("entry", f.getEntryPoint().toString());
+            out.add(m);
+        }
+        return out;
+    }
+
+    // ========================================================================
     // Batch Variable Rename
     // ========================================================================
 
@@ -2646,7 +3330,7 @@ public class FunctionService {
         final List<String> errors = new ArrayList<>();
         final List<String> warnings = new ArrayList<>();
         final AtomicReference<Function> funcRef = new AtomicReference<>(null);
-        final AtomicReference<String> fallbackResult = new AtomicReference<>(null);
+        final AtomicReference<Response> fallbackResult = new AtomicReference<>(null);
         final AtomicReference<String> errorRef = new AtomicReference<>(null);
 
         try {
@@ -2669,8 +3353,7 @@ public class FunctionService {
                         // Use decompiler to access SSA variables (the ones that appear in decompiled code)
                         DecompInterface decomp = null;
                         try {
-                            decomp = new DecompInterface();
-                            decomp.openProgram(program);
+                            decomp = ServiceUtils.createConfiguredDecompiler(program);
 
                             DecompileResults decompResult = decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
                             if (decompResult != null && decompResult.decompileCompleted()) {
@@ -2781,7 +3464,7 @@ public class FunctionService {
                     try {
                         // Try individual operations (transactions will be closed in finally)
                         Response individualResult = batchRenameVariablesIndividual(functionAddress, variableRenames, programName);
-                        fallbackResult.set(individualResult.toJson());
+                        fallbackResult.set(individualResult);
                     } catch (Exception fallbackE) {
                         errorRef.set("Batch operation failed and fallback also failed: " + e.getMessage());
                         Msg.error(this, "Both batch and individual rename operations failed", e);
@@ -2797,8 +3480,7 @@ public class FunctionService {
                         try {
                             DecompInterface tempDecomp = null;
                             try {
-                                tempDecomp = new DecompInterface();
-                                tempDecomp.openProgram(program);
+                                tempDecomp = ServiceUtils.createConfiguredDecompiler(program);
                                 tempDecomp.flushCache();
                                 tempDecomp.decompileFunction(funcRef.get(), DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
                             } finally {
@@ -2816,7 +3498,7 @@ public class FunctionService {
 
             // Return fallback result if used
             if (fallbackResult.get() != null) {
-                return Response.text(fallbackResult.get());
+                return fallbackResult.get();
             }
 
             if (errorRef.get() != null) {
@@ -3005,8 +3687,7 @@ public class FunctionService {
                     // Phase 2: Decompile to get fresh SSA variables for renaming
                     DecompInterface decomp = null;
                     try {
-                        decomp = new DecompInterface();
-                        decomp.openProgram(program);
+                        decomp = ServiceUtils.createConfiguredDecompiler(program);
                         DecompileResults decompResult = decomp.decompileFunction(func, DECOMPILE_TIMEOUT_SECONDS, new ConsoleTaskMonitor());
                         if (decompResult == null || !decompResult.decompileCompleted()) {
                             errors.add("Decompilation failed after type changes; renames skipped");
@@ -3375,18 +4056,23 @@ public class FunctionService {
     }
 
     @McpTool(path = "/add_function_tag", method = "POST",
-             description = "Attach one or more tags to a function. Tags are comma-separated and will be auto-created if they do not already exist.",
+             description = "Attach tags to ONE function (function + tags) OR MANY in one transaction (assignments=[{function,tags}, ...]). Tags are comma-separated and auto-created. Replaces batch_add_function_tags.",
              category = "function")
     public Response addFunctionTag(
-            @Param(value = "function", source = ParamSource.BODY, paramType = "address",
-                   description = "Function address or function name") String functionRef,
-            @Param(value = "tags", source = ParamSource.BODY,
-                   description = "Comma-separated tag names to attach (e.g. \"syscall,lpe-surface\")") String tagsCsv,
+            @Param(value = "function", source = ParamSource.BODY, paramType = "address", defaultValue = "",
+                   description = "Function address or name (single mode). Omit when using assignments[].") String functionRef,
+            @Param(value = "tags", source = ParamSource.BODY, defaultValue = "",
+                   description = "Comma-separated tag names to attach (single mode).") String tagsCsv,
+            @Param(value = "assignments", source = ParamSource.BODY, defaultValue = "[]",
+                   description = "Bulk mode: array of {function, tags} objects. When non-empty, function/tags are ignored.") List<Map<String, String>> assignments,
             @Param(value = "program", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
-        if (functionRef == null || functionRef.isEmpty()) return Response.err("function is required");
+        if (assignments != null && !assignments.isEmpty()) {
+            return batchAddFunctionTags(assignments, programName);
+        }
+        if (functionRef == null || functionRef.isEmpty()) return Response.err("function is required (or pass assignments[] for bulk)");
         List<String> tagNames = splitTagList(tagsCsv);
         if (tagNames.isEmpty()) return Response.err("tags is required (comma-separated list)");
 
@@ -3421,18 +4107,23 @@ public class FunctionService {
     }
 
     @McpTool(path = "/remove_function_tag", method = "POST",
-             description = "Detach one or more tags from a function. Does not delete the program-wide tag definition — use delete_function_tag for that.",
+             description = "Detach tags from ONE function (function + tags) OR MANY in one transaction (assignments=[{function,tags}, ...]). Does not delete the program-wide tag definition — use delete_function_tag for that. Replaces batch_remove_function_tags.",
              category = "function")
     public Response removeFunctionTag(
-            @Param(value = "function", source = ParamSource.BODY, paramType = "address",
-                   description = "Function address or function name") String functionRef,
-            @Param(value = "tags", source = ParamSource.BODY,
-                   description = "Comma-separated tag names to detach") String tagsCsv,
+            @Param(value = "function", source = ParamSource.BODY, paramType = "address", defaultValue = "",
+                   description = "Function address or name (single mode). Omit when using assignments[].") String functionRef,
+            @Param(value = "tags", source = ParamSource.BODY, defaultValue = "",
+                   description = "Comma-separated tag names to detach (single mode).") String tagsCsv,
+            @Param(value = "assignments", source = ParamSource.BODY, defaultValue = "[]",
+                   description = "Bulk mode: array of {function, tags} objects. When non-empty, function/tags are ignored.") List<Map<String, String>> assignments,
             @Param(value = "program", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
-        if (functionRef == null || functionRef.isEmpty()) return Response.err("function is required");
+        if (assignments != null && !assignments.isEmpty()) {
+            return batchRemoveFunctionTags(assignments, programName);
+        }
+        if (functionRef == null || functionRef.isEmpty()) return Response.err("function is required (or pass assignments[] for bulk)");
         List<String> tagNames = splitTagList(tagsCsv);
         if (tagNames.isEmpty()) return Response.err("tags is required (comma-separated list)");
 
@@ -3653,9 +4344,8 @@ public class FunctionService {
                 "functions", page));
     }
 
-    @McpTool(path = "/batch_add_function_tags", method = "POST",
-             description = "Attach tags to many functions in one transaction. Body: [{\"function\":\"0x140200ae6\",\"tags\":\"syscall,lpe-surface\"}, ...]. Tags auto-create.",
-             category = "function")
+    // Bulk helper for add_function_tag(assignments=[...]). Merged into add_function_tag in
+    // 7.0.0; no longer a standalone @McpTool.
     public Response batchAddFunctionTags(
             @Param(value = "assignments", source = ParamSource.BODY,
                    description = "Array of {function, tags} objects. `function` may be an address or name; `tags` is a comma-separated list.") List<Map<String, String>> assignments,
@@ -3723,9 +4413,8 @@ public class FunctionService {
                 "results", results));
     }
 
-    @McpTool(path = "/batch_remove_function_tags", method = "POST",
-             description = "Detach tags from many functions in one transaction. Body shape matches /batch_add_function_tags.",
-             category = "function")
+    // Bulk helper for remove_function_tag(assignments=[...]). Merged into remove_function_tag
+    // in 7.0.0; no longer a standalone @McpTool.
     public Response batchRemoveFunctionTags(
             @Param(value = "assignments", source = ParamSource.BODY,
                    description = "Array of {function, tags} objects.") List<Map<String, String>> assignments,

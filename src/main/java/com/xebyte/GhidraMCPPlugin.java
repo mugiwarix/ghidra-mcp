@@ -95,6 +95,7 @@ import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -106,7 +107,7 @@ import java.util.regex.Pattern;
 
 // Load version from properties file (populated by Maven during build)
 class VersionInfo {
-    private static String VERSION = "5.12.0"; // Default fallback
+    private static String VERSION = "7.0.0"; // Default fallback
     private static String APP_NAME = "GhidraMCP";
     private static String GHIDRA_VERSION = "unknown"; // Loaded from version.properties (Maven-filtered)
     private static String BUILD_TIMESTAMP = "dev"; // Will be replaced by Maven
@@ -199,6 +200,13 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     private static final AtomicInteger activeRequests = new AtomicInteger(0);
     private static final long serverStartMillis = System.currentTimeMillis();
     private static int instanceCount = 0;
+    // Live plugin instances. The TCP server's route lambdas capture the
+    // owning instance's services (programProvider, listingService, …); when
+    // that instance is disposed first while others survive, the routes are
+    // left bound to a dead PluginTool. dispose() consults this list to hand
+    // ownership to a survivor by restarting the server with its services.
+    private static final java.util.List<GhidraMCPPlugin> liveInstances =
+        new java.util.concurrent.CopyOnWriteArrayList<>();
     private boolean ownsServer = false; // true if this instance started the server
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
@@ -278,6 +286,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
         instanceCount++;
+        liveInstances.add(this);
 
         // Initialize service layer — FrontEnd mode: opens programs on-demand from project
         this.programProvider = new FrontEndProgramProvider(tool, this);
@@ -329,7 +338,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         options.registerOption(STRICT_NAMING_ENFORCEMENT_OPTION,
             NamingPolicy.defaultStrictNamingEnforcement(), null,
             "Reject function/global names that fail the built-in name-quality checks " +
-            "on rename_function_by_address, rename_data, rename_global_variable, " +
+            "on rename_function, rename_symbol, " +
             "set_global, and related write guards. Also controls struct-field " +
             "Hungarian prefix auto-fixes. Disable when your naming convention " +
             "does not match the built-in heuristic; function/global convention warnings are still returned. " +
@@ -652,10 +661,30 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                 }
             }));
         }
+        // These routes are registered below via their own server.createContext(...)
+        // calls (utility/server/project/tool endpoints that predate the @McpTool
+        // convention), so they are already live and callable. Without this they
+        // stayed invisible in /mcp/schema -- and therefore invisible to the Python
+        // bridge's dynamic tool discovery -- even though a caller who knew the raw
+        // path could reach them. Found via a live-schema-vs-catalog diff (v6.0.0).
+        com.xebyte.core.ManualToolDescriptors.addAll(scanner,
+            "/batch_apply_documentation", "/check_connection",
+            "/exit_ghidra", "/get_current_address", "/get_current_function",
+            "/get_current_selection", "/get_version",
+            "/mcp/health", "/mcp/schema", "/open_project", "/project/info",
+            "/server/admin/set_permissions", "/server/admin/terminate_all_checkouts",
+            "/server/admin/terminate_checkout", "/server/admin/users", "/server/authenticate",
+            "/server/checkouts", "/server/connect", "/server/disconnect",
+            "/server/repositories", "/server/repository/create", "/server/repository/file",
+            "/server/repository/files", "/server/status", "/server/version_control/add",
+            "/server/version_control/checkin", "/server/version_control/checkout",
+            "/server/version_control/undo_checkout", "/server/version_history",
+            "/tool/goto_address", "/tool/launch_codebrowser", "/tool/running_tools");
         // Reflect the live count so /get_version.endpoint_count matches
-        // what /mcp/schema actually serves. Previously a hardcoded constant
-        // that drifted as services added new @McpTool methods.
-        VersionInfo.setEndpointCount(scanner.getEndpoints().size());
+        // what /mcp/schema actually serves. Includes both the dispatch-table
+        // (@McpTool-scanned) endpoints and the manually-registered routes just
+        // added to the schema above.
+        VersionInfo.setEndpointCount(scanner.getDescriptors().size());
 
         // ==========================================================================
         // SCHEMA ENDPOINT — Serves machine-readable API metadata
@@ -783,74 +812,6 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                 || Boolean.parseBoolean(String.valueOf(params.get("headless")));
             String programToLaunch = params.get("program") != null ? params.get("program").toString() : null;
             sendResponse(exchange, openProject(projectPath, headless, programToLaunch));
-        }));
-
-        // GET_DATA_TYPE_SIZE - Get the size in bytes of a data type (not yet in service layer)
-        server.createContext("/get_data_type_size", safeHandler(exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
-            String typeName = qparams.get("type_name");
-
-            if (typeName == null || typeName.isEmpty()) {
-                sendResponse(exchange, "{\"error\": \"type_name parameter is required\"}");
-                return;
-            }
-
-            Program program = getCurrentProgram();
-            if (program == null) {
-                sendResponse(exchange, "{\"error\": \"No program open\"}");
-                return;
-            }
-
-            DataType dt = resolveDataType(program.getDataTypeManager(), typeName);
-            if (dt == null) {
-                sendResponse(exchange, "{\"error\": \"Data type not found: " + typeName + "\"}");
-                return;
-            }
-
-            String category = dt.getCategoryPath().toString();
-            if (category.equals("/")) {
-                category = "builtin";
-            }
-
-            StringBuilder sb = new StringBuilder();
-            sb.append("{\"type_name\": \"").append(dt.getName()).append("\", ");
-            sb.append("\"size\": ").append(dt.getLength()).append(", ");
-            sb.append("\"category\": \"").append(category.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"}");
-            sendResponse(exchange, sb.toString());
-        }));
-
-        // BATCH_SET_VARIABLE_TYPES - Set types for multiple variables (uses local optimized method)
-        server.createContext("/batch_set_variable_types", safeHandler(exchange -> {
-            try {
-                Map<String, Object> params = parseJsonParams(exchange);
-                String functionAddress = (String) params.get("function_address");
-
-                // Handle variable_types as either Map or String (JSON parsing variation)
-                Object vtObj = params.get("variable_types");
-                Map<String, String> variableTypes;
-                if (vtObj instanceof Map) {
-                    @SuppressWarnings("unchecked")
-                    Map<String, String> vtMap = (Map<String, String>) vtObj;
-                    variableTypes = vtMap;
-                } else if (vtObj instanceof String vtStr) {
-                    variableTypes = new HashMap<>();
-                    Map<String, Object> parsed = JsonHelper.parseJson(vtStr);
-                    for (var e : parsed.entrySet()) {
-                        variableTypes.put(e.getKey(), e.getValue() != null ? String.valueOf(e.getValue()) : null);
-                    }
-                } else {
-                    variableTypes = new HashMap<>();
-                }
-
-                // Use optimized method
-                String result = batchSetVariableTypesOptimized(functionAddress, variableTypes);
-                sendResponse(exchange, result);
-            } catch (Exception e) {
-                // Catch any exceptions to prevent connection aborts
-                String errorMsg = "{\"error\": \"" + e.getMessage().replace("\"", "\\\"") + "\", \"method\": \"optimized\"}";
-                sendResponse(exchange, errorMsg);
-                Msg.error(this, "Error in batch_set_variable_types endpoint", e);
-            }
         }));
 
         server.createContext("/exit_ghidra", safeHandler(exchange -> {
@@ -1047,7 +1008,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         //
         // WHY (original problem): HttpServer.setExecutor(null) uses ONE thread
         // for all requests, so any slow request (save_program,
-        // batch_analyze_completeness) blocks every subsequent request strictly
+        // analyze_function_completeness) blocks every subsequent request strictly
         // FIFO — including cheap read-only ones like /mcp/schema which have no
         // EDT dependency. Measured: /mcp/schema (15ms at idle) took 54,000ms
         // while a batch call was in flight. See tests/performance/
@@ -1177,7 +1138,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     }
 
     private String renameFunction(String oldName, String newName, String programName) {
-        return functionService.renameFunction(oldName, newName, programName).toJson();
+        return functionService.renameFunctionByAddress(oldName, newName, programName).toJson();
     }
 
     private String renameDataAtAddress(String addressStr, String newName, String programName) {
@@ -1387,22 +1348,6 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     @SuppressWarnings("deprecation")
     private String setCommentAtAddress(String addressStr, String comment, int commentType, String transactionName) {
         return commentService.setCommentAtAddress(addressStr, comment, commentType, transactionName).toJson();
-    }
-
-    private String setDecompilerComment(String addressStr, String comment, String programName) {
-        return commentService.setDecompilerComment(addressStr, comment, programName).toJson();
-    }
-
-    private String setDecompilerComment(String addressStr, String comment) {
-        return commentService.setDecompilerComment(addressStr, comment).toJson();
-    }
-
-    private String setDisassemblyComment(String addressStr, String comment, String programName) {
-        return commentService.setDisassemblyComment(addressStr, comment, programName).toJson();
-    }
-
-    private String setDisassemblyComment(String addressStr, String comment) {
-        return commentService.setDisassemblyComment(addressStr, comment).toJson();
     }
 
     private String renameFunctionByAddress(String functionAddrStr, String newName, String programName) {
@@ -1871,7 +1816,13 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      * Parse post body form params, e.g. oldName=foo&newName=bar
      */
     private Map<String, String> parsePostParams(HttpExchange exchange) throws IOException {
-        byte[] body = exchange.getRequestBody().readAllBytes();
+        // Bounded read: never let a lying/absent Content-Length force an
+        // unbounded allocation. Oversized bodies are truncated to empty.
+        int cap = (int) com.xebyte.core.SecurityConfig.MAX_REQUEST_BODY_BYTES;
+        byte[] body = exchange.getRequestBody().readNBytes(cap + 1);
+        if (body.length > com.xebyte.core.SecurityConfig.MAX_REQUEST_BODY_BYTES) {
+            return new HashMap<>();
+        }
         String bodyStr = new String(body, StandardCharsets.UTF_8);
         Map<String, String> params = new HashMap<>();
         for (String pair : bodyStr.split("&")) {
@@ -2082,7 +2033,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                 info.put("trace", trace.getName());
                 info.put("tool", runningTool.getName());
                 try {
-                    traceMgr.saveTrace(trace).get(30, TimeUnit.SECONDS);
+                    saveTraceWithRetry(traceMgr, trace);
                     traceMgr.closeTraceNoConfirm(trace);
                     saved.add(info);
                 } catch (Throwable e) {
@@ -2099,6 +2050,38 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
             "traces", saved,
             "errors", errors
         );
+    }
+
+    /**
+     * Save a debugger trace, retrying if the attempt races an in-flight
+     * transaction on the trace's own domain object -- the same {@code
+     * IOException: Unable to lock due to active transaction} documented for
+     * program saves in {@code ProgramScriptService.saveWithRetry}, confirmed
+     * live against a debugger trace too (2026-07-26): a trace accumulates its
+     * own transactions from continuous Trace RMI sync writes (module/register
+     * updates), and one can still be open when {@code exit_ghidra} saves on
+     * the way out. A short backoff-and-retry on that specific message is the
+     * same pragmatic fix as the program-save case.
+     */
+    private void saveTraceWithRetry(DebuggerTraceManagerService traceMgr, Trace trace)
+            throws Exception {
+        final int maxAttempts = 4;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                traceMgr.saveTrace(trace).get(30, TimeUnit.SECONDS);
+                return;
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                String msg = cause != null ? cause.getMessage() : e.getMessage();
+                boolean isLockRace = msg != null && msg.contains("Unable to lock due to active transaction");
+                if (!isLockRace || attempt == maxAttempts) {
+                    throw e;
+                }
+                Msg.warn(this, "Trace save raced an active transaction (attempt "
+                        + attempt + "/" + maxAttempts + "), retrying: " + msg);
+                Thread.sleep(150L * attempt);
+            }
+        }
     }
 
     private String listOpenPrograms() {
@@ -2185,7 +2168,7 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      *
      * Also measures handler wall time and logs a WARN for anything exceeding
      * SLOW_HANDLER_WARN_MS. This surfaces slow endpoints (save_program,
-     * batch_analyze_completeness, anything that hits a cold decompiler cache)
+     * analyze_function_completeness, anything that hits a cold decompiler cache)
      * in the Ghidra log immediately, so you can correlate dashboard slowness
      * with the actual offending endpoint instead of guessing. Tracks active
      * handler count for /mcp/health.
@@ -2209,6 +2192,21 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
             try {
                 if (!isAuthExempt(path)) {
                     com.xebyte.core.SecurityConfig sec = com.xebyte.core.SecurityConfig.getInstance();
+                    // Anti-CSRF / DNS-rebinding: reject cross-origin browser
+                    // requests (and non-loopback Host) when running token-less
+                    // on loopback. No-op once a token is configured.
+                    String crossOriginError = sec.rejectCrossOriginRequest(
+                            exchange.getRequestHeaders().getFirst("Host"),
+                            exchange.getRequestHeaders().getFirst("Origin"));
+                    if (crossOriginError != null) {
+                        byte[] body = ("{\"error\": \"" + crossOriginError + "\"}")
+                                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                        exchange.getResponseHeaders().set("Content-Type", "application/json");
+                        exchange.sendResponseHeaders(403, body.length);
+                        exchange.getResponseBody().write(body);
+                        exchange.getResponseBody().close();
+                        return;
+                    }
                     if (sec.isAuthEnabled()) {
                         String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
                         if (!sec.matchesBearerAuth(authHeader)) {
@@ -2221,14 +2219,30 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
                             return;
                         }
                     }
+                    // Reject an oversized declared body up front (the actual
+                    // read is bounded downstream regardless of Content-Length).
+                    if (com.xebyte.core.SecurityConfig.exceedsMaxBody(
+                            exchange.getRequestHeaders().getFirst("Content-Length"))) {
+                        byte[] body = "{\"error\": \"Request body too large\"}"
+                                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                        exchange.getResponseHeaders().set("Content-Type", "application/json");
+                        exchange.sendResponseHeaders(413, body.length);
+                        exchange.getResponseBody().write(body);
+                        exchange.getResponseBody().close();
+                        return;
+                    }
                 }
                 handler.handle(exchange);
             } catch (Throwable e) {
+                // Uncaught handler failure: log full detail server-side (Ghidra
+                // log) and return a generic message. Echoing e.getMessage() can
+                // leak absolute paths, class names, and internal state.
+                // Deliberate validation errors are returned by the handlers
+                // themselves via Response.err (HTTP 200) and are unaffected.
+                Msg.error(this, "Unhandled error handling " + path, e);
                 try {
-                    String msg = e.getMessage() != null ? e.getMessage() : e.toString();
-                    String safeMsg = msg.replace("\\", "\\\\").replace("\"", "\\\"")
-                                       .replace("\n", "\\n").replace("\r", "\\r");
-                    sendResponse(exchange, "{\"error\": \"" + safeMsg + "\"}");
+                    sendResponse(exchange,
+                        "{\"error\": \"Internal server error. See the Ghidra application log for details.\"}");
                 } catch (Throwable ignored) {
                     // Last resort - response already sent or exchange broken
                     Msg.error(this, "Failed to send error response", ignored);
@@ -2517,13 +2531,6 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
      */
     private String getMetadata() {
         return programScriptService.getMetadata().toJson();
-    }
-
-    /**
-     * Convert a number to different representations
-     */
-    private String convertNumber(String text, int size) {
-        return com.xebyte.core.ServiceUtils.convertNumber(text, size);
     }
 
     /**
@@ -2956,16 +2963,12 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         return commentService.clearFunctionComments(functionAddress, clearPlate, clearPre, clearEol).toJson();
     }
 
-    private String setPlateComment(String functionAddress, String comment) {
-        return commentService.setPlateComment(functionAddress, comment).toJson();
-    }
-
     /**
      * v1.5.0: Get all variables in a function (parameters and locals)
      */
     @SuppressWarnings("deprecation")
     private String getFunctionVariables(String functionName, String programName) {
-        return functionService.getFunctionVariables(functionName, null, programName, null, null).toJson();
+        return functionService.getFunctionVariables(functionName, null, programName, 200, null).toJson();
     }
 
     // Backward compatibility overload
@@ -3336,13 +3339,6 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
     }
 
     /**
-     * NEW v1.6.0: Check if data type exists in type manager
-     */
-    private String validateDataTypeExists(String typeName) {
-        return dataTypeService.validateDataTypeExists(typeName).toJson();
-    }
-
-    /**
      * NEW v1.6.0: Determine if address has data/code and suggest operation
      */
     private String canRenameAtAddress(String addressStr, String programName) {
@@ -3401,14 +3397,6 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
 
     private String createFunctionAtAddress(String addressStr, String name, boolean disassembleFirst) {
         return functionService.createFunctionAtAddress(addressStr, name, disassembleFirst).toJson();
-    }
-
-    private String generateScriptContent(String purpose, String workflowType, Map<String, Object> parameters) {
-        return programScriptService.generateScriptContent(purpose, workflowType, parameters).toJson();
-    }
-
-    private String generateScriptName(String workflowType) {
-        return programScriptService.generateScriptName(workflowType);
     }
 
     /**
@@ -3612,6 +3600,15 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         sb.append(", \"is_checked_out_exclusive\": ").append(f.isCheckedOutExclusive());
         sb.append(", \"is_read_only\": ").append(f.isReadOnly());
         if (f.isCheckedOut()) {
+            // Whether a checkout still holds UNCOMMITTED local work is the one
+            // thing that decides if it is safe to release -- and it was not
+            // observable through any endpoint, so the only way to answer it was
+            // to read icons in the Ghidra GUI. On a shared project that work
+            // exists solely in the local project directory: no server copy, no
+            // backup. Surface it so a tool can tell "idle checkout" (safe to
+            // undo) from "holds work" (must be checked in first).
+            sb.append(", \"modified_since_checkout\": ").append(f.modifiedSinceCheckout());
+            sb.append(", \"is_hijacked\": ").append(f.isHijacked());
             try {
                 ItemCheckoutStatus status = f.getCheckoutStatus();
                 if (status != null) {
@@ -4303,14 +4300,46 @@ public class GhidraMCPPlugin extends Plugin implements ApplicationLevelPlugin {
         // Deregister from UDS ServerManager
         ServerManager.getInstance().deregisterTool(tool);
 
+        liveInstances.remove(this);
         instanceCount--;
-        // Only stop the server when the last plugin instance is disposed
+
+        // This instance's programProvider is dead either way — release the
+        // programs it was holding, regardless of whether other windows
+        // survive. (Previously only the last-disposed instance released.)
+        try {
+            programProvider.releaseAll();
+        } catch (Exception e) {
+            Msg.warn(this, "GhidraMCP: releaseAll on dispose: " + e.getMessage());
+        }
+
         if (instanceCount <= 0) {
             stopServer();
-            programProvider.releaseAll();
             instanceCount = 0;
+        } else if (ownsServer) {
+            // The TCP routes (createContext lambdas) captured THIS
+            // instance's services. With this PluginTool now disposed,
+            // every subsequent HTTP request would execute against stale
+            // services. Hand the server to a surviving instance by
+            // restarting it so the routes re-bind to live services.
+            Msg.info(this, "GhidraMCP: owning tool window closed with "
+                + instanceCount + " other window(s) still active — handing "
+                + "TCP server ownership to a survivor.");
+            stopServer();
+            ownsServer = false;
+            GhidraMCPPlugin survivor = liveInstances.isEmpty() ? null : liveInstances.get(0);
+            if (survivor != null) {
+                try {
+                    survivor.startServer();
+                    survivor.ownsServer = true;
+                } catch (IOException e) {
+                    Msg.error(this, "GhidraMCP: failed to restart TCP server "
+                        + "on surviving tool window: " + e.getMessage()
+                        + " — use Tools > GhidraMCP > Start Server.");
+                }
+            }
         } else {
-            Msg.info(this, "GhidraMCP: " + instanceCount + " tool window(s) still active, keeping server running.");
+            Msg.info(this, "GhidraMCP: " + instanceCount
+                + " tool window(s) still active, keeping server running.");
         }
         if (startServerAction != null) {
             tool.removeAction(startServerAction);

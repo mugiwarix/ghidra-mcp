@@ -9,7 +9,73 @@ For the release preparation runbook, see
 
 ## Current Releases
 
-### v5.12.0 (Latest) — community-driven tools: /get_current_selection + GUI /open_project
+### v7.0.0 (unreleased) — tool consolidation, JSON response contract, conformance suite
+
+**Major release, breaking.** The advertised surface consolidates **272 → 251
+tools**: five rename tools collapse into `rename_symbol`, four variable-type
+setters into `set_variable_type`, six `batch_*` tools into their one-or-many
+survivors, and the comment family into `set_comment` / `get_comment` with an
+explicit kind. No capability is removed — every operation the deleted tools
+performed is reachable through the survivor — and there are no
+backward-compatibility aliases.
+
+Every endpoint that answered in prose now answers **JSON**. List-shaped tools
+return a named plural key plus `count`/`total`; errors are `{"error": ...}`.
+Anything parsing stdout as English needs updating; the old→new call-site
+contract is in
+[MIGRATION_7.0.0_TOOL_CONSOLIDATION.md](../project-management/MIGRATION_7.0.0_TOOL_CONSOLIDATION.md).
+
+A new **MCP-protocol conformance suite** drives the server through a real MCP
+client rather than raw HTTP, and is the reason a dozen genuine bugs are known —
+including two that could freeze the server (`close_program` and auto-analysis).
+
+Also: `doc_lint.py`, a documentation *correctness* linter backed by Ghidra's
+Function ID analyzer, and a `rename_function` gate that refuses to overwrite an
+FID-produced name.
+
+- See [CHANGELOG.md](../../CHANGELOG.md) for full details.
+
+### v6.0.0 — program storage tools, flow repair, provider resilience
+
+Minor release. Closes the last two gaps in Ghidra's per-program storage
+surface: **program options / metadata** (`list_option_groups`,
+`get_program_options`, `set_program_option`, `remove_program_option`) and
+**property maps** (`list_property_maps`, `create_property_map`,
+`delete_property_map`, `set_property`, `get_property`, `remove_property`,
+`list_properties`) — typed per-address key→value stores, the clean home for
+arbitrary structured per-function data. Adds **any-address comment tools**
+(`get_comment` / `set_comment`) covering all five comment types at any
+address, where the existing comment tools were function-scoped.
+
+Flow correctness: `set_function_no_return` now synchronizes the flag across
+every thunk hop and reports verified state (#385), and the new
+`clear_flow_and_repair` wraps Ghidra's `ClearFlowAndRepairCmd` so flow
+damaged by a wrong no-return marking can be repaired without full
+re-analysis (#384).
+
+Also: `GHIDRA_MCP_AUTH_TOKEN` support in the Python bridge (#358), headless
+Java script execution (#368), CORS preflight fixed for browser MCP clients,
+outbound archive/BSim destinations now fail closed (#391), and fun-doc no
+longer burns its queue when a provider is quota-walled or terminally
+broken. 272 tools.
+
+- See [CHANGELOG.md](../../CHANGELOG.md) for full details.
+
+### v5.15.0 — headless GZF/GAR round-trip + debugger write primitives
+
+Minor release. Headless program (`.gzf`) and project (`.gar`) archive
+round-trip endpoints — `/export_program`, `/import_program`,
+`/archive_project`, `/restore_project` — with two rounds of path-safety
+hardening (traversal rejection, ambiguous-name resolution, exact-name
+program lookup, non-destructive overwrite, post-restore verification).
+Docker's Jython extension now auto-unpacks for Ghidra 12.1+. The
+standalone debugger server gained `write_memory` / `write_registers`
+primitives for driving controlled execution of inlined code fragments.
+255 tools.
+
+- See [CHANGELOG.md](../../CHANGELOG.md) for full details.
+
+### v5.12.0 — community-driven tools: /get_current_selection + GUI /open_project
 
 Minor release. Two new endpoints filed/scoped by community feedback,
 plus a quiet headless parity fix that surfaced while writing the
@@ -206,7 +272,7 @@ community-reported fixes plus the gemini-cli-sdk reconciliation.
   pom bumped 12.0.4 → 12.1; CI / release / Docker download metadata
   pointed at the Ghidra 12.1 20260513 upstream asset; setup docs,
   examples, defaults, and compatibility tests refreshed for
-  `ghidra_12.1_PUBLIC`. Documents the 12.1 shared-server requirement
+  `ghidra_12.1.2_PUBLIC`. Documents the 12.1 shared-server requirement
   (clients on 12.1 need server 12.1 or 12.0.5+) and that Jython is
   optional in 12.1 (install via File → Install Extensions if you run
   `.py` Ghidra scripts).

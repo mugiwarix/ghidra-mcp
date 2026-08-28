@@ -4,6 +4,7 @@ import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.framework.options.Options;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.address.AddressSet;
@@ -235,16 +236,16 @@ public class AnalysisService {
             int before = program.getFunctionManager().getFunctionCount();
 
             AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);
-            int txId = program.startTransaction("Run Auto Analysis");
-            boolean success = false;
-            try {
+            threadingStrategy.executeWrite(program, "Run Auto Analysis", () -> {
                 mgr.initializeOptions();
                 mgr.reAnalyzeAll(program.getMemory().getLoadedAndInitializedAddressSet());
                 mgr.startAnalysis(TaskMonitor.DUMMY);
-                success = true;
-            } finally {
-                program.endTransaction(txId, success);
-            }
+                // Persist the ANALYZED flag so a later /save_all_programs + .gar
+                // export does not produce an archive that re-prompts "binary
+                // has not been analyzed" when restored in the GUI.
+                ghidra.program.util.GhidraProgramUtilities.markProgramAnalyzed(program);
+                return null;
+            });
 
             long duration = System.currentTimeMillis() - start;
             int after = program.getFunctionManager().getFunctionCount();
@@ -1293,24 +1294,30 @@ public class AnalysisService {
         return analyzeFunctionCompleteness(functionAddress, compact, null);
     }
 
+    public Response analyzeFunctionCompleteness(String functionAddress, boolean compact, String programName) {
+        return analyzeFunctionCompleteness(functionAddress, compact, "", programName);
+    }
+
     /**
      * Analyze function documentation completeness.
      * @param compact When true, returns only scores and issue counts (no arrays, no recommendations).
      *                Reduces response from ~20KB to ~300 bytes.
      */
-    @McpTool(path = "/analyze_function_completeness", description = "Check function documentation completeness. On programs with multiple address spaces (e.g., embedded targets), prefix addresses with the space name (mem:1000) to avoid ambiguous resolution.", category = "analysis")
+    @McpTool(path = "/analyze_function_completeness", description = "Check documentation completeness for ONE function (function_address) OR MANY (addresses=comma-separated list). On programs with multiple address spaces, prefix addresses with the space name (mem:1000). Replaces batch_analyze_completeness.", category = "analysis")
     public Response analyzeFunctionCompleteness(
-            @Param(value = "function_address", paramType = "address",
-                   description = "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
-                               + "(e.g., mem:1000, code:ff00). Note: some programs — particularly "
-                               + "embedded/microcontroller targets — are not address-space-agnostic; "
-                               + "use get_address_spaces to discover spaces before assuming a plain hex "
-                               + "address is unambiguous.") String functionAddress,
-            @Param(value = "compact", defaultValue = "false", description = "Compact output") boolean compact,
+            @Param(value = "function_address", paramType = "address", defaultValue = "",
+                   description = "Function address (single mode). 0x<hex> or <space>:<hex>. Omit when using addresses=.") String functionAddress,
+            @Param(value = "compact", defaultValue = "false", description = "Compact output (single mode)") boolean compact,
+            @Param(value = "addresses", defaultValue = "",
+                   description = "Bulk mode: comma-separated addresses. When set, function_address/compact are ignored.") String addressesCsv,
             @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
+
+        if (addressesCsv != null && !addressesCsv.trim().isEmpty()) {
+            return batchAnalyzeCompleteness(addressesCsv, programName);
+        }
 
         // Resolve address before entering SwingUtilities lambda
         Address addr = ServiceUtils.parseAddress(program, functionAddress);
@@ -1477,8 +1484,8 @@ public class AnalysisService {
                                         String impliedType = inferTypeFromHungarianPrefix(name);
                                         if (impliedType != null) {
                                             String fixAction = isRegisterOnly
-                                                ? " — fix: type may be register-only, try set_local_variable_type('" + name + "', '" + impliedType.split("/")[0] + "'), on failure use PRE_COMMENT"
-                                                : " — fix: set_local_variable_type('" + name + "', '" + impliedType.split("/")[0] + "')";
+                                                ? " — fix: type may be register-only, try set_variable_type('" + name + "', '" + impliedType.split("/")[0] + "'), on failure use PRE_COMMENT"
+                                                : " — fix: set_variable_type('" + name + "', '" + impliedType.split("/")[0] + "')";
                                             undefinedVars.add(name + " (WORKFLOW: renamed with '" + impliedType +
                                                 "' prefix but type is still " + typeName + fixAction + ")");
                                         }
@@ -1495,7 +1502,7 @@ public class AnalysisService {
                                                 bufferHint.contains("data") || bufferHint.contains("callback") ||
                                                 bufferHint.contains("param") || bufferHint.contains("state");
                                             if (suggestStruct) {
-                                                undefinedVars.add(name + " (STRUCT: " + arraySize + "-byte buffer with struct-like name — create struct with create_struct(), then set_local_variable_type('" + name + "', 'YourStructName'))");
+                                                undefinedVars.add(name + " (STRUCT: " + arraySize + "-byte buffer with struct-like name — create struct with create_struct(), then set_variable_type('" + name + "', 'YourStructName'))");
                                             } else if (arraySize >= 16) {
                                                 // Large buffers always suggest struct even without name hints
                                                 undefinedVars.add(name + " (STRUCT: " + arraySize + "-byte buffer — likely needs struct definition via create_struct())");
@@ -1922,7 +1929,7 @@ public class AnalysisService {
         return Response.ok(resultData.get());
     }
 
-    @McpTool(path = "/batch_analyze_completeness", method = "POST", description = "Analyze completeness for multiple functions", category = "analysis")
+    // Bulk helper for analyze_function_completeness(addresses=...). Merged in 7.0.0.
     @SuppressWarnings("unchecked")
     public Response batchAnalyzeCompleteness(
             @Param(value = "addresses", source = ParamSource.BODY) Object addressesObj,
@@ -1960,23 +1967,25 @@ public class AnalysisService {
         // Trade-off: slightly more invokeAndWait overhead per address, but
         // GUI stays responsive and internal deadlocks don't happen.
         final int CHUNK_SIZE = 1;
-        StringBuilder sb = new StringBuilder();
-        sb.append("{\"results\": [");
-        boolean first = true;
+        List<Object> results = new ArrayList<>();
 
         for (int chunkStart = 0; chunkStart < addresses.size(); chunkStart += CHUNK_SIZE) {
             final int start = chunkStart;
             final int end = Math.min(chunkStart + CHUNK_SIZE, addresses.size());
-            final StringBuilder chunkOut = new StringBuilder();
+            final List<Object> chunkOut = new ArrayList<>();
             final AtomicReference<String> chunkErr = new AtomicReference<>(null);
 
             Runnable chunkWork = () -> {
                 try {
                     for (int i = start; i < end; i++) {
-                        if (i > start) chunkOut.append(", ");
-                        chunkOut.append(
-                            analyzeFunctionCompleteness(addresses.get(i), false, programName).toJson()
-                        );
+                        Response r = analyzeFunctionCompleteness(addresses.get(i), false, programName);
+                        if (r instanceof Response.Ok ok) {
+                            chunkOut.add(ok.data());
+                        } else if (r instanceof Response.Err err) {
+                            chunkOut.add(JsonHelper.mapOf("error", err.message()));
+                        } else {
+                            chunkOut.add(JsonHelper.mapOf("error", "Unexpected response shape"));
+                        }
                     }
                 } catch (Exception e) {
                     chunkErr.set(e.getMessage());
@@ -2009,12 +2018,7 @@ public class AnalysisService {
                 if (chunkErr.get() != null) {
                     // Inline the error as this chunk's placeholder result and
                     // continue with the next chunk rather than aborting
-                    if (!first) sb.append(", ");
-                    sb.append(String.format(
-                        "{\"error\": \"chunk_error: %s\"}",
-                        chunkErr.get().replace("\\", "\\\\").replace("\"", "\\\"")
-                    ));
-                    first = false;
+                    results.add(JsonHelper.mapOf("error", "chunk_error: " + chunkErr.get()));
                     continue;
                 }
             } else {
@@ -2034,12 +2038,7 @@ public class AnalysisService {
                     chunkTimedOut = true;
                 } catch (Exception e) {
                     // Other exception — inline as error and continue
-                    if (!first) sb.append(", ");
-                    sb.append(String.format(
-                        "{\"error\": \"chunk_exception: %s\"}",
-                        String.valueOf(e.getMessage()).replace("\\", "\\\\").replace("\"", "\\\"")
-                    ));
-                    first = false;
+                    results.add(JsonHelper.mapOf("error", "chunk_exception: " + e.getMessage()));
                     continue;
                 }
                 if (chunkTimedOut) {
@@ -2049,32 +2048,21 @@ public class AnalysisService {
                     // still running on the EDT but we're no longer waiting.
                     String addr = addresses.get(start);
                     Msg.warn(this, String.format(
-                        "batch_analyze_completeness: function %s (index %d) exceeded %ds — skipping to next",
+                        "analyze_function_completeness: function %s (index %d) exceeded %ds — skipping to next",
                         addr, start, PER_CHUNK_TIMEOUT_SEC
                     ));
-                    if (!first) sb.append(", ");
-                    sb.append(String.format(
-                        "{\"error\": \"chunk_timeout: %s exceeded %ds on EDT\"}",
-                        addr, PER_CHUNK_TIMEOUT_SEC
-                    ));
-                    first = false;
+                    results.add(JsonHelper.mapOf("error",
+                        "chunk_timeout: " + addr + " exceeded " + PER_CHUNK_TIMEOUT_SEC + "s on EDT"));
                     continue;
                 }
                 if (chunkErr.get() != null) {
                     // Inner exception — inline as error and continue
-                    if (!first) sb.append(", ");
-                    sb.append(String.format(
-                        "{\"error\": \"chunk_error: %s\"}",
-                        chunkErr.get().replace("\\", "\\\\").replace("\"", "\\\"")
-                    ));
-                    first = false;
+                    results.add(JsonHelper.mapOf("error", "chunk_error: " + chunkErr.get()));
                     continue;
                 }
             }
 
-            if (!first) sb.append(", ");
-            sb.append(chunkOut);
-            first = false;
+            results.addAll(chunkOut);
 
             // Yield between chunks so the EDT can service queued GUI events
             // (mouse clicks, keyboard input, paint events). Without this pause,
@@ -2089,8 +2077,7 @@ public class AnalysisService {
                 }
             }
         }
-        sb.append("], \"count\": ").append(addresses.size()).append("}");
-        return Response.text(sb.toString());
+        return Response.ok(JsonHelper.mapOf("results", results, "count", addresses.size()));
     }
 
     /**
@@ -2760,7 +2747,8 @@ public class AnalysisService {
                         double pts = Math.min(8.0 * untypedCount, 8.0);
                         globalDeductions += pts;
                         breakdown.add(deductionItem("untyped_global", pts, true, untypedCount,
-                                untypedCount + " referenced global(s) have undefined* type"));
+                                untypedCount + " referenced global(s) have a placeholder type "
+                                + "(undefined* or bare pointer)"));
                     }
                     if (unformattedCount > 0) {
                         double pts = Math.min(5.0 * unformattedCount, 5.0);
@@ -3020,17 +3008,17 @@ public class AnalysisService {
         if (!unrenamedGlobals.isEmpty()) {
             recommendations.add("UNRENAMED DAT_* GLOBALS DETECTED - Must rename before documentation is complete:");
             recommendations.add("1. Found " + unrenamedGlobals.size() + " DAT_* reference(s): " + String.join(", ", unrenamedGlobals.subList(0, Math.min(5, unrenamedGlobals.size()))));
-            recommendations.add("2. Use rename_or_label() or rename_data() to give meaningful names to each global");
+            recommendations.add("2. Use rename_symbol() to give meaningful names to each global");
             recommendations.add("3. Apply Hungarian notation with g_ prefix: g_dwPlayerCount, g_pCurrentGame, g_abEncryptionKey");
             recommendations.add("4. If global is a structure, apply type with apply_data_type() first, then rename");
-            recommendations.add("5. Consult KNOWN_ORDINALS.md and existing codebase for naming conventions");
+            recommendations.add("5. Match naming to how existing renamed globals in this program are named");
         }
 
         // UNRENAMED LAB_* LABELS (auto-generated goto targets)
         if (!unrenamedLabels.isEmpty()) {
             recommendations.add("UNRENAMED LAB_* LABELS DETECTED - Rename auto-generated labels to descriptive names:");
             recommendations.add("1. Found " + unrenamedLabels.size() + " LAB_* label(s): " + String.join(", ", unrenamedLabels.subList(0, Math.min(5, unrenamedLabels.size()))));
-            recommendations.add("2. Use rename_label() to give meaningful names (e.g., LAB_6fd71a3c -> exitEarly, LAB_6fd71a50 -> processNextItem)");
+            recommendations.add("2. Use rename_symbol() to give meaningful names (e.g., LAB_6fd71a3c -> exitEarly, LAB_6fd71a50 -> processNextItem)");
             recommendations.add("3. Skip labels that are simple fall-through targets with no external xrefs");
         }
 
@@ -3038,8 +3026,8 @@ public class AnalysisService {
         if (!undocumentedOrdinals.isEmpty()) {
             recommendations.add("UNDOCUMENTED ORDINAL CALLS - Add inline comments for each:");
             recommendations.add("1. Found " + undocumentedOrdinals.size() + " Ordinal call(s) without comments: " + String.join(", ", undocumentedOrdinals.subList(0, Math.min(5, undocumentedOrdinals.size()))));
-            recommendations.add("2. Consult docs/KNOWN_ORDINALS.md for Ordinal mappings (Storm.dll, Fog.dll ordinals documented)");
-            recommendations.add("3. Use set_decompiler_comment() or batch_set_comments() to add inline comment explaining the call");
+            recommendations.add("2. Resolve the Ordinal via get_external_location() or list_external_locations() on the importing module");
+            recommendations.add("3. Use set_comment(type='pre') or batch_set_comments() to add inline comment explaining the call");
             recommendations.add("4. Format: /* Ordinal_123 = StorageFunctionName - brief description */");
         }
 
@@ -3059,20 +3047,20 @@ public class AnalysisService {
                     + String.join(", ", unresolvedStructAccesses.subList(0, Math.min(5, unresolvedStructAccesses.size()))));
             recommendations.add("2. Use search_data_types() to find existing struct definitions");
             recommendations.add("3. If no struct exists, use create_struct() with fields matching the observed offsets");
-            recommendations.add("4. Apply struct type to variables with set_local_variable_type() or set_function_prototype()");
+            recommendations.add("4. Apply struct type to variables with set_variable_type() or set_function_prototype()");
         }
 
-        // CRITICAL: Undefined Type Audit (FUNCTION_DOC_WORKFLOW_V4.md Mandatory Undefined Type Audit)
+        // CRITICAL: Undefined Type Audit (FUNCTION_DOC_WORKFLOW_V5.md Mandatory Undefined Type Audit)
         if (!undefinedVars.isEmpty()) {
-            recommendations.add("UNDEFINED TYPES DETECTED - Follow FUNCTION_DOC_WORKFLOW_V4.md 'Mandatory Undefined Type Audit' section:");
+            recommendations.add("UNDEFINED TYPES DETECTED - Follow FUNCTION_DOC_WORKFLOW_V5.md 'Mandatory Undefined Type Audit' section:");
             recommendations.add("1. Type Resolution: Apply type normalization before renaming:");
             recommendations.add("   - undefined1 -> byte (8-bit integer)");
             recommendations.add("   - undefined2 -> ushort/short (16-bit integer)");
             recommendations.add("   - undefined4 -> uint/int/float/pointer (32-bit - check usage context)");
             recommendations.add("   - undefined8 -> double/ulonglong/longlong (64-bit)");
             recommendations.add("   - undefined1[N] -> byte[N] (byte array for XMM spills, buffers)");
-            recommendations.add("2. Use set_local_variable_type() with lowercase builtin types (uint, ushort, byte) NOT uppercase Windows types (UINT, USHORT, BYTE)");
-            recommendations.add("3. CRITICAL: Check disassembly with get_disassembly() for assembly-only undefined types:");
+            recommendations.add("2. Use set_variable_type() with lowercase builtin types (uint, ushort, byte) NOT uppercase Windows types (UINT, USHORT, BYTE)");
+            recommendations.add("3. CRITICAL: Check disassembly with disassemble_function() for assembly-only undefined types:");
             recommendations.add("   - Stack temporaries: [EBP + local_offset] not in get_function_variables()");
             recommendations.add("   - XMM register spills: undefined1[16] at stack locations");
             recommendations.add("   - Intermediate calculation results not appearing in decompiled view");
@@ -3081,7 +3069,7 @@ public class AnalysisService {
 
         // Plate Comment Issues
         if (!plateCommentIssues.isEmpty()) {
-            recommendations.add("PLATE COMMENT ISSUES - Follow FUNCTION_DOC_WORKFLOW_V4.md 'Plate Comment Creation' section:");
+            recommendations.add("PLATE COMMENT ISSUES - Follow FUNCTION_DOC_WORKFLOW_V5.md 'Plate Comment Creation' section:");
             for (String issue : plateCommentIssues) {
                 if (issue.contains("Missing Algorithm section")) {
                     recommendations.add("1. Add Algorithm section with numbered steps describing operations (validation, function calls, error handling)");
@@ -3095,7 +3083,7 @@ public class AnalysisService {
                     recommendations.add("5. Expand plate comment to minimum 10 lines with comprehensive documentation");
                 }
             }
-            recommendations.add("Use set_plate_comment() to create/update plate comment following docs/prompts/PLATE_COMMENT_FORMAT_GUIDE.md");
+            recommendations.add("Use set_comment(type='plate') to create/update plate comment following docs/PLATE_COMMENT_BEST_PRACTICES.md");
         }
 
         // Hungarian Notation Violations
@@ -3110,7 +3098,7 @@ public class AnalysisService {
                 }
                 recommendations.add("FIX THE TYPE, NOT THE NAME. The human-assigned name is correct; the decompiler-inferred type is wrong.");
             }
-            recommendations.add("HUNGARIAN NOTATION VIOLATIONS - Follow FUNCTION_DOC_WORKFLOW_V4.md 'Local Variable Renaming' section and docs/HUNGARIAN_NOTATION.md:");
+            recommendations.add("HUNGARIAN NOTATION VIOLATIONS - Follow FUNCTION_DOC_WORKFLOW_V5.md 'Local Variable Renaming' section and docs/HUNGARIAN_NOTATION.md:");
             recommendations.add("1. Verify type-to-prefix mapping matches Ghidra type:");
             recommendations.add("   - byte -> b/by | char -> c/ch | bool -> f | short -> n/s | ushort -> w");
             recommendations.add("   - int -> n/i | uint -> dw | long -> l | ulong -> dw");
@@ -3118,14 +3106,14 @@ public class AnalysisService {
             recommendations.add("   - void* -> p | typed pointers -> p+StructName (pUnitAny)");
             recommendations.add("   - byte[N] -> ab | ushort[N] -> aw | uint[N] -> ad");
             recommendations.add("   - char* -> sz/lpsz | wchar_t* -> wsz");
-            recommendations.add("2. First set correct type with set_local_variable_type() using lowercase builtin");
+            recommendations.add("2. First set correct type with set_variable_type() using lowercase builtin");
             recommendations.add("3. Then rename with rename_variables() using correct Hungarian prefix");
             recommendations.add("4. For globals, add g_ prefix before type prefix: g_dwProcessId, g_abEncryptionKey");
         }
 
         // Type Quality Issues
         if (!typeQualityIssues.isEmpty()) {
-            recommendations.add("TYPE QUALITY ISSUES - Follow FUNCTION_DOC_WORKFLOW_V4.md 'Structure Identification' section:");
+            recommendations.add("TYPE QUALITY ISSUES - Follow FUNCTION_DOC_WORKFLOW_V5.md 'Structure Identification' section:");
             for (String issue : typeQualityIssues) {
                 if (issue.contains("Unresolved this pointer")) {
                     recommendations.add("UNRESOLVED THIS POINTER - __thiscall function has void* this:");
@@ -3154,22 +3142,22 @@ public class AnalysisService {
                     recommendations.add("GENERIC VOID* LOCAL VARIABLE - needs typed struct pointer:");
                     recommendations.add("1. " + issue);
                     recommendations.add("2. Identify the struct type from field accesses and cast patterns in the decompiled code");
-                    recommendations.add("3. Use set_local_variable_type() to change void* to the correct struct pointer type");
+                    recommendations.add("3. Use set_variable_type() to change void* to the correct struct pointer type");
                 } else if (issue.startsWith("Generic int* local:")) {
                     recommendations.add("GENERIC INT* LOCAL VARIABLE - p-prefix local typed as int* instead of struct pointer:");
                     recommendations.add("1. " + issue);
                     recommendations.add("2. Identify the actual struct type from usage context (field accesses, callees)");
-                    recommendations.add("3. Use set_local_variable_type() to change int* to the correct struct pointer type");
+                    recommendations.add("3. Use set_variable_type() to change int* to the correct struct pointer type");
                 } else if (issue.startsWith("Local prefix-type mismatch:")) {
                     recommendations.add("LOCAL PREFIX-TYPE MISMATCH - Local variable name suggests pointer but type is scalar:");
                     recommendations.add("1. " + issue);
-                    recommendations.add("2. Fix the type with set_local_variable_type() to use correct pointer type");
+                    recommendations.add("2. Fix the type with set_variable_type() to use correct pointer type");
                     recommendations.add("3. Then verify Hungarian prefix still matches the new type");
                 } else if (issue.contains("Undocumented parameter")) {
                     recommendations.add("UNDOCUMENTED PARAMETER - Plate comment missing parameter description:");
                     recommendations.add("1. " + issue);
                     recommendations.add("2. Add a line to the plate comment Parameters section: paramName — description");
-                    recommendations.add("3. Use set_plate_comment() to update the plate comment");
+                    recommendations.add("3. Use set_comment(type='plate') to update the plate comment");
                 } else if (issue.contains("State-based type name")) {
                     recommendations.add("2. Rename state-based type names to identity-based names:");
                     recommendations.add("   BAD: InitializedGameObject, AllocatedBuffer, ProcessedData");
@@ -3196,7 +3184,7 @@ public class AnalysisService {
             recommendations.add("   - Ordinal/DLL calls explaining their purpose");
             recommendations.add("   - Structure field accesses explaining data meaning");
             recommendations.add("   - Error handling paths explaining expected failures");
-            recommendations.add("3. Use set_decompiler_comment() for individual comments or batch_set_comments() for multiple");
+            recommendations.add("3. Use set_comment(type='pre') for individual comments or batch_set_comments() for multiple");
         }
 
         // General Workflow Guidance -- only show if there are fixable issues
@@ -3208,17 +3196,17 @@ public class AnalysisService {
                 recommendations.add("3. Add concise plate comment with Purpose/Origin/Parameters/Returns.");
                 recommendations.add("4. Re-score and stop when only structural deductions remain.");
             } else {
-                recommendations.add("COMPLETE WORKFLOW (FUNCTION_DOC_WORKFLOW_V4.md):");
+                recommendations.add("COMPLETE WORKFLOW (FUNCTION_DOC_WORKFLOW_V5.md):");
                 recommendations.add("1. Initialize: get_current_selection() + analyze_function_complete() -- gather decompiled code, xrefs, callees, callers, disassembly, variables");
                 recommendations.add("2. Classify: Leaf/Worker/Thunk/Init/Callback/Public API/Internal utility");
                 recommendations.add("3. Mandatory Undefined Type Audit: examine BOTH decompiled code and disassembly for undefined types");
                 recommendations.add("4. Verify Decompiler vs Assembly: loops, type casts, pointer arithmetic, conditionals, early exits");
                 recommendations.add("5. Control Flow + Loop Mapping: return points, loop headers/bounds/stride, error paths");
                 recommendations.add("6. Structure Identification: search_data_types() or create_struct(), memory model docs");
-                recommendations.add("7. Rename + Prototype: rename_function_by_address() (PascalCase) + set_function_prototype()");
-                recommendations.add("8. Local Variable Renaming: set_local_variable_type() then rename_variables() with Hungarian notation");
-                recommendations.add("9. Global Data: rename_or_label() with g_ prefix for DAT_*/s_* references");
-                recommendations.add("10. Plate Comment: set_plate_comment() per PLATE_COMMENT_FORMAT_GUIDE.md (Algorithm, Parameters, Returns, Structure Layout, Magic Numbers)");
+                recommendations.add("7. Rename + Prototype: rename_function() (PascalCase) + set_function_prototype()");
+                recommendations.add("8. Local Variable Renaming: set_variable_type() then rename_variables() with Hungarian notation");
+                recommendations.add("9. Global Data: rename_symbol() with g_ prefix for DAT_*/s_* references");
+                recommendations.add("10. Plate Comment: set_comment(type='plate') per docs/PLATE_COMMENT_BEST_PRACTICES.md (Algorithm, Parameters, Returns, Structure Layout, Magic Numbers)");
                 recommendations.add("11. Inline Comments: PRE_COMMENTs + EOL_COMMENTs via batch_set_comments()");
                 recommendations.add("12. Verify: analyze_function_completeness() once -- accept phantom/void* deductions");
             }
@@ -3307,7 +3295,7 @@ public class AnalysisService {
             actions.add(JsonHelper.mapOf(
                     "issue_type", "auto_name",
                     "priority", "high",
-                    "tool", "rename_function_by_address",
+                    "tool", "rename_function",
                     "params_template", JsonHelper.mapOf("function_address", func.getEntryPoint().toString(), "new_name", "<PascalCaseName>"),
                     "evidence", Collections.singletonList(func.getName()),
                     "estimated_gain", 30
@@ -3319,7 +3307,7 @@ public class AnalysisService {
             actions.add(JsonHelper.mapOf(
                     "issue_type", "undefined_variables",
                     "priority", "high",
-                    "tool", "set_local_variable_type",
+                    "tool", "set_variable_type",
                     "params_template", JsonHelper.mapOf("function_address", func.getEntryPoint().toString(), "variable_name", "<var>", "new_type", "<resolved_type>"),
                     "evidence", evidence,
                     "estimated_gain", Math.min(25, undefinedVars.size() * (isCompilerHelper ? 2 : 5))
@@ -3342,8 +3330,8 @@ public class AnalysisService {
             actions.add(JsonHelper.mapOf(
                     "issue_type", "plate_comment",
                     "priority", "medium",
-                    "tool", "set_plate_comment",
-                    "params_template", JsonHelper.mapOf("function_address", func.getEntryPoint().toString(), "comment", "<plate_comment_text>"),
+                    "tool", "set_comment",
+                    "params_template", JsonHelper.mapOf("address", func.getEntryPoint().toString(), "type", "plate", "comment", "<plate_comment_text>"),
                     "evidence", new ArrayList<>(plateCommentIssues.subList(0, Math.min(5, plateCommentIssues.size()))),
                     "estimated_gain", Math.min(20, plateCommentIssues.size() * (isCompilerHelper ? 2 : 5))
             ));
@@ -3394,8 +3382,8 @@ public class AnalysisService {
             actions.add(JsonHelper.mapOf(
                     "issue_type", "local_type_quality",
                     "priority", "high",
-                    "tool", "set_local_variable_type",
-                    "params_template", JsonHelper.mapOf("function_address", func.getEntryPoint().toString(), "name", "<variable_name>", "data_type", "<StructName> *"),
+                    "tool", "set_variable_type",
+                    "params_template", JsonHelper.mapOf("function_address", func.getEntryPoint().toString(), "variable_name", "<variable_name>", "new_type", "<StructName> *"),
                     "evidence", new ArrayList<>(localIssues.subList(0, Math.min(5, localIssues.size()))),
                     "estimated_gain", (int) Math.min(20, localIssues.size() * 10)
             ));
@@ -3405,8 +3393,8 @@ public class AnalysisService {
             actions.add(JsonHelper.mapOf(
                     "issue_type", "unrenamed_globals",
                     "priority", "high",
-                    "tool", "rename_or_label",
-                    "params_template", JsonHelper.mapOf("address", "<global_address>", "name", "g_<typedName>"),
+                    "tool", "rename_symbol",
+                    "params_template", JsonHelper.mapOf("target", "<global_address>", "new_name", "g_<typedName>"),
                     "evidence", new ArrayList<>(unrenamedGlobals.subList(0, Math.min(5, unrenamedGlobals.size()))),
                     "estimated_gain", Math.min(20, unrenamedGlobals.size() * 3)
             ));
@@ -3416,8 +3404,8 @@ public class AnalysisService {
             actions.add(JsonHelper.mapOf(
                     "issue_type", "unrenamed_labels",
                     "priority", "low",
-                    "tool", "rename_label",
-                    "params_template", JsonHelper.mapOf("address", "<label_address>", "old_name", "LAB_xxxxxxxx", "new_name", "<descriptive_label>"),
+                    "tool", "rename_symbol",
+                    "params_template", JsonHelper.mapOf("target", "<label_address>", "kind", "label", "old_name", "LAB_xxxxxxxx", "new_name", "<descriptive_label>"),
                     "evidence", new ArrayList<>(unrenamedLabels.subList(0, Math.min(5, unrenamedLabels.size()))),
                     "estimated_gain", Math.min(10, unrenamedLabels.size() * 2)
             ));
@@ -3427,8 +3415,8 @@ public class AnalysisService {
             actions.add(JsonHelper.mapOf(
                     "issue_type", "undocumented_ordinals",
                     "priority", "medium",
-                    "tool", "set_decompiler_comment",
-                    "params_template", JsonHelper.mapOf("address", "<call_site>", "comment", "Ordinal_<n> = <resolved_name>"),
+                    "tool", "set_comment",
+                    "params_template", JsonHelper.mapOf("address", "<call_site>", "type", "pre", "comment", "Ordinal_<n> = <resolved_name>"),
                     "evidence", new ArrayList<>(undocumentedOrdinals.subList(0, Math.min(5, undocumentedOrdinals.size()))),
                     "estimated_gain", Math.min(10, undocumentedOrdinals.size() * 2)
             ));
@@ -3679,7 +3667,7 @@ public class AnalysisService {
                             violations.add(varName + " (REVERSE MISMATCH: name prefix implies " + prefixImplied +
                                 " but type is " + typeName +
                                 " — fix TYPE to " + suggestedType +
-                                " via set_function_prototype() or set_local_variable_type())");
+                                " via set_function_prototype() or set_variable_type())");
                             return;
                         }
                     }
@@ -3962,11 +3950,11 @@ public class AnalysisService {
                                 String matchedStruct = findMatchingStructType(dtm, localName);
                                 if (matchedStruct != null) {
                                     issues.add("Generic void* local: " + localName +
-                                              " — struct '" + matchedStruct + "' exists, use set_local_variable_type('" +
+                                              " — struct '" + matchedStruct + "' exists, use set_variable_type('" +
                                               localName + "', '" + matchedStruct + " *')");
                                 } else {
                                     issues.add("Generic void* local: " + localName +
-                                              " (p-prefix suggests typed struct pointer — create struct with create_struct() then set_local_variable_type())");
+                                              " (p-prefix suggests typed struct pointer — create struct with create_struct() then set_variable_type())");
                                 }
                             }
                         }
@@ -3981,11 +3969,11 @@ public class AnalysisService {
                                 String matchedStruct = findMatchingStructType(dtm, localName);
                                 if (matchedStruct != null) {
                                     issues.add("Generic int* local: " + localName +
-                                              " — struct '" + matchedStruct + "' exists, use set_local_variable_type('" +
+                                              " — struct '" + matchedStruct + "' exists, use set_variable_type('" +
                                               localName + "', '" + matchedStruct + " *')");
                                 } else {
                                     issues.add("Generic int* local: " + localName +
-                                              " (p-prefix suggests typed struct pointer, not int* — create struct then set_local_variable_type())");
+                                              " (p-prefix suggests typed struct pointer, not int* — create struct then set_variable_type())");
                                 }
                             }
                         }
@@ -4001,7 +3989,7 @@ public class AnalysisService {
                                 if (matchedStruct != null) {
                                     issues.add("Local prefix-type mismatch: " + localName +
                                               " has p prefix but type is " + localTypeName +
-                                              " — struct '" + matchedStruct + "' exists, use set_local_variable_type('" +
+                                              " — struct '" + matchedStruct + "' exists, use set_variable_type('" +
                                               localName + "', '" + matchedStruct + " *')");
                                 } else {
                                     issues.add("Local prefix-type mismatch: " + localName +
@@ -4386,22 +4374,33 @@ public class AnalysisService {
                     }
                     data.put("locals", localList);
 
-                    // DAT global count (unrenamed globals referenced)
+                    // DAT global count (unrenamed globals referenced).
+                    // getReferenceIterator(minAddr) yields ALL outgoing
+                    // references from that address through the end of the
+                    // program — for a function near the start of a large
+                    // binary the old loop walked millions of references per
+                    // call. getReferenceSourceIterator(body, true) is bounded
+                    // to addresses inside the function body (and handles
+                    // non-contiguous bodies correctly).
                     int datGlobalCount = 0;
-                    ReferenceIterator refIter = program.getReferenceManager().getReferenceIterator(func.getBody().getMinAddress());
-                    while (refIter.hasNext()) {
-                        Reference ref = refIter.next();
-                        if (!func.getBody().contains(ref.getFromAddress())) continue;
-                        Address toAddr = ref.getToAddress();
-                        Symbol sym = program.getSymbolTable().getPrimarySymbol(toAddr);
-                        if (sym != null && sym.getName().startsWith("DAT_")) {
-                            datGlobalCount++;
+                    ReferenceManager refMgr = program.getReferenceManager();
+                    AddressIterator srcIter = refMgr.getReferenceSourceIterator(func.getBody(), true);
+                    while (srcIter.hasNext()) {
+                        Address fromAddr = srcIter.next();
+                        for (Reference ref : refMgr.getReferencesFrom(fromAddr)) {
+                            Address toAddr = ref.getToAddress();
+                            Symbol sym = program.getSymbolTable().getPrimarySymbol(toAddr);
+                            if (sym != null && sym.getName().startsWith("DAT_")) {
+                                datGlobalCount++;
+                            }
                         }
                     }
                     data.put("dat_global_count", datGlobalCount);
 
-                    // Compact completeness score
-                    Response completenessResponse = analyzeFunctionCompleteness(func.getEntryPoint().toString(), true);
+                    // Compact completeness score. Forward programName so the
+                    // nested call resolves the same program the caller asked
+                    // for via ?program=, not the active one (matches L2383).
+                    Response completenessResponse = analyzeFunctionCompleteness(func.getEntryPoint().toString(), true, programName);
                     if (completenessResponse instanceof Response.Ok ok) {
                         data.put("completeness", ok.data());
                     }

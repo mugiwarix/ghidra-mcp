@@ -157,8 +157,10 @@ class TestLiveServerSmoke:
     def test_program_metadata_present(self, http_client):
         response = http_client.get("/get_metadata")
         assert response.status_code == 200
-        text = response.text.lower()
-        assert "program name" in text or "executable path" in text
+        # 7.0.0 response contract: a record, not "Program Name: <x>" prose.
+        payload = json.loads(response.text)
+        assert payload.get("program_name"), payload
+        assert "architecture" in payload and "language" in payload
 
     def test_list_functions_returns_live_data(self, http_client):
         response = http_client.get("/list_functions", params={"limit": 3})
@@ -173,7 +175,7 @@ class TestLiveServerSmoke:
 class TestSafeRoundTripSmoke:
     def test_plate_comment_round_trip(self, http_client, first_function_address):
         get_response = http_client.get(
-            "/get_plate_comment", params={"address": first_function_address}
+            "/get_comment", params={"address": first_function_address}
         )
         if get_response.status_code != 200:
             pytest.skip("Plate comment endpoint unavailable")
@@ -182,13 +184,14 @@ class TestSafeRoundTripSmoke:
         try:
             payload = json.loads(get_response.text)
             if isinstance(payload, dict):
-                comment = payload.get("comment", "") or ""
+                comment = payload.get("plate", "") or ""
         except json.JSONDecodeError:
             comment = comment.strip('"')
 
         set_response = http_client.post(
-            "/set_plate_comment",
-            data={"address": first_function_address, "comment": comment},
+            "/set_comment",
+            data={"address": first_function_address, "type": "plate",
+                  "comment": comment},
         )
         assert set_response.status_code in [200, 400, 404]
 

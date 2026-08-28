@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -63,6 +64,10 @@ DEFAULT_BENCHMARK_FOLDER = "/testing/benchmark"
 DEFAULT_BENCHMARK_PROGRAM = f"{DEFAULT_BENCHMARK_FOLDER}/Benchmark.dll"
 DEFAULT_BENCHMARK_DEBUG_PROGRAM = f"{DEFAULT_BENCHMARK_FOLDER}/BenchmarkDebug.exe"
 DEFAULT_BENCHMARK_FUNCTION = "calc_crc16"
+# Max seconds to wait for post-import benchmark analysis to settle before the
+# YAML regression asserts. Sized for a cold install (freshly-created Ghidra
+# user-config dir), where the first analysis pass runs well past a minute.
+BENCHMARK_ANALYSIS_TIMEOUT_S = 240
 BENCHMARK_DEPLOY_TEST_MODES = {
     "benchmark-read",
     "benchmark-write",
@@ -75,13 +80,13 @@ SMOKE_REQUIRED_TOOLS = {
     "get_function_variables",
     "analyze_function_completeness",
     "batch_set_comments",
-    "set_local_variable_type",
+    "set_variable_type",
     "rename_variables",
     "prompt_policy",
     "save_program",
     "save_all_programs",
     "set_function_prototype",
-    "rename_function_by_address",
+    "rename_function",
     "search_data_types",
     "create_struct",
     "get_struct_layout",
@@ -461,15 +466,16 @@ def find_ghidra_executable(ghidra_path: Path) -> Path:
 
 def find_plugin_archive(repo_root: Path) -> Path:
     version = read_pom_versions(repo_root).project_version
-    # Check Gradle output first, then Maven target/ for backward compatibility during transition.
+    # Prefer the freshest current-version output. Both backends may leave artifacts behind,
+    # so fixed backend priority can silently deploy a stale archive.
     candidates = [
         repo_root / "build" / "distributions" / f"GhidraMCP-{version}.zip",
         repo_root / "target" / f"GhidraMCP-{version}.zip",
         repo_root / "target" / "GhidraMCP.zip",
     ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
+    existing_candidates = [candidate for candidate in candidates if candidate.is_file()]
+    if existing_candidates:
+        return max(existing_candidates, key=lambda path: path.stat().st_mtime)
 
     for search_dir in [repo_root / "build" / "distributions", repo_root / "target"]:
         archives = sorted(
@@ -679,6 +685,46 @@ def _terminate_processes_by_name(process_name: str) -> None:
         subprocess.run(["taskkill", "/IM", process_name, "/F"], check=False)
         return
     subprocess.run(["pkill", "-f", process_name], check=False)
+
+
+def _terminate_dbgeng_launcher_processes() -> None:
+    """Kill Ghidra's local-dbgeng launcher backend (the ``cmd.exe`` wrapper
+    and the ``python -i ..\\support\\local-dbgeng.py`` process it spawns),
+    not the debuggee itself.
+
+    Confirmed live (2026-07-26): once a dbgeng session has parked the target
+    at a debug event, Windows will not let a plain ``taskkill`` reach the
+    debuggee -- it reports "no running instance of the task" even though
+    ``tasklist`` still sees it, and this holds even after
+    ``/debugger/resume``. The lock on any DLL the debuggee has loaded (e.g.
+    ``Benchmark.dll``, if the debuggee links against it) persists as long as
+    the debuggee lives, and blocks a subsequent ``reset_benchmark_fixture``'s
+    ``/delete_file`` with "file is in use". Killing the launcher backend
+    instead releases dbgeng's own grip -- the debuggee then either exits on
+    its own or becomes immediately killable by a plain ``taskkill``, both
+    confirmed live in the same investigation. This is intentionally separate
+    from ``_terminate_processes_by_name`` (which targets the debuggee by
+    name): call this FIRST, then that.
+    """
+    if os.name != "nt":
+        return
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.CommandLine -match 'local-dbgeng' } | "
+            "Select-Object -ExpandProperty ProcessId"
+        ),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return
+    for line in completed.stdout.splitlines():
+        pid_text = line.strip()
+        if pid_text.isdigit():
+            _terminate_process(int(pid_text))
 
 
 def _project_state_path_from_gpr(project_path: str) -> Path | None:
@@ -921,7 +967,15 @@ def _close_and_delete_project_file(repo_root: Path, mcp_url: str, program_path: 
                 repo_root,
                 mcp_url,
                 "/close_program",
-                data={"name": program_path},
+                # save=False: this program is about to be deleted and
+                # re-imported from disk right below, so there's nothing
+                # worth saving -- and saving is not the point here anyway.
+                # Before /close_program grew a save/discard choice, closing
+                # a dirty benchmark fixture would fall through to Ghidra's
+                # interactive "Save changes?" dialog, which blocks the Swing
+                # event thread (and every other MCP request with it) until a
+                # human dismisses it.
+                data={"name": program_path, "save": False},
                 method="POST",
                 timeout=30,
             )
@@ -946,11 +1000,44 @@ def _close_and_delete_project_file(repo_root: Path, mcp_url: str, program_path: 
 def reset_benchmark_fixture(repo_root: Path, mcp_url: str) -> None:
     benchmark_dll = repo_root / DEFAULT_BENCHMARK_DLL
     benchmark_debug_exe = repo_root / DEFAULT_BENCHMARK_DEBUG_EXE
+    # A BenchmarkDebug.exe left over from a prior debugger session can be
+    # parked at a debug event under dbgeng, which taskkill-by-name silently
+    # can't touch (see _terminate_dbgeng_launcher_processes) -- confirmed
+    # live: that leaves Benchmark.dll locked and this function's own
+    # /delete_file below fails with "file is in use" a few lines down,
+    # despite this same taskkill call already having "succeeded" (taskkill
+    # against an unreachable dbgeng-held process doesn't raise; it just
+    # doesn't work). Release the launcher backend's grip first so the
+    # by-name kill that follows actually has something killable to act on.
+    # No settle delay here (unlike run_debugger_live_test's own cleanup,
+    # see its finally block for the full explanation): this call is cleaning
+    # up a session from an earlier, already-finished invocation, not one
+    # this function just used, so there's no "just stopped talking to it"
+    # moment to wait out -- and in the normal deploy sequence this runs
+    # before any debugger activity at all, so a blind sleep would be pure
+    # waste on every ordinary fixture reset.
+    _terminate_dbgeng_launcher_processes()
     _terminate_processes_by_name("BenchmarkDebug.exe")
     if not benchmark_dll.is_file() or not benchmark_debug_exe.is_file():
+        build_script = repo_root / "fun-doc" / "benchmark" / "build.py"
+        if not build_script.is_file():
+            # fun-doc moved to the d2-game-exe repo on 2026-08-11 and took the
+            # benchmark fixture with it. Say so plainly: without this guard the
+            # only symptom is a CalledProcessError with exit status 2 from a
+            # subprocess.run on a path that does not exist, which reads as a
+            # build failure rather than a relocation.
+            raise RuntimeError(
+                f"Benchmark fixture source is missing: {build_script}\n"
+                "fun-doc (and its benchmark/) moved to the d2-game-exe "
+                "repository. The release-regression modes that reset this "
+                "fixture cannot run from this repo any more.\n"
+                "Either run them from d2-game-exe, or deploy without the "
+                "benchmark-backed --test modes (endpoint-catalog and "
+                "selected-contract do not need it)."
+            )
         print("Benchmark binary output missing; building it now.")
         subprocess.run(
-            [sys.executable, str(repo_root / "fun-doc" / "benchmark" / "build.py")],
+            [sys.executable, str(build_script)],
             cwd=repo_root,
             check=True,
         )
@@ -1070,7 +1157,16 @@ def _list_benchmark_exports(repo_root: Path, mcp_url: str) -> list[tuple[str, st
     )
     _ensure_mcp_ok("/list_exports", payload)
     exports: list[tuple[str, str]] = []
-    if isinstance(payload, str):
+    if isinstance(payload, dict):
+        # 7.0.0 response contract: {"exports": [{"name", "address"}], "count", ...}
+        for export in payload.get("exports") or []:
+            if not isinstance(export, dict):
+                continue
+            name = str(export.get("name") or "")
+            address = export.get("address")
+            if name and address:
+                exports.append((name, str(address)))
+    elif isinstance(payload, str):
         for line in payload.splitlines():
             match = re.match(r"(.+?)\s+->\s+([0-9a-fA-Fx]+)\s*$", line.strip())
             if match:
@@ -1184,7 +1280,7 @@ def run_benchmark_read_test(repo_root: Path, mcp_url: str) -> None:
         ("/decompile_function", {"program": DEFAULT_BENCHMARK_PROGRAM, "address": address}),
         ("/get_function_variables", {"program": DEFAULT_BENCHMARK_PROGRAM, "address": address}),
         ("/analyze_function_completeness", {"program": DEFAULT_BENCHMARK_PROGRAM, "function_address": address}),
-        ("/get_plate_comment", {"program": DEFAULT_BENCHMARK_PROGRAM, "address": address}),
+        ("/get_comment", {"program": DEFAULT_BENCHMARK_PROGRAM, "address": address}),
         ("/save_program", {"program": DEFAULT_BENCHMARK_PROGRAM}),
     ]
     for path, params in read_calls:
@@ -1265,7 +1361,7 @@ def run_benchmark_write_test(repo_root: Path, mcp_url: str) -> None:
             },
         ),
         (
-            "/set_local_variable_type",
+            "/set_variable_type",
             {
                 "function_address": address,
                 "variable_name": variable_name,
@@ -1281,9 +1377,9 @@ def run_benchmark_write_test(repo_root: Path, mcp_url: str) -> None:
             },
         ),
         (
-            "/rename_function_by_address",
+            "/rename_function",
             {
-                "function_address": address,
+                "old_name": address,
                 "new_name": "DeploySmokeCalcCrc16",
             },
         ),
@@ -1333,7 +1429,7 @@ def run_negative_contract_test(repo_root: Path, mcp_url: str) -> None:
     _status, payload = _mcp_request(
         repo_root,
         mcp_url,
-        "/set_local_variable_type",
+        "/set_variable_type",
         params={"program": DEFAULT_BENCHMARK_PROGRAM},
         data={
             "function_address": address,
@@ -1344,7 +1440,7 @@ def run_negative_contract_test(repo_root: Path, mcp_url: str) -> None:
         timeout=60,
     )
     _expect_mcp_error(
-        "/set_local_variable_type",
+        "/set_variable_type",
         payload,
         ("definitely_missing_local", "available variables"),
     )
@@ -1477,8 +1573,9 @@ def run_debugger_live_test(repo_root: Path, mcp_url: str) -> None:
                     f"Debugger backend unavailable on this machine: "
                     f"{launch_err}. Install the Windows Debugger Toolkit "
                     "(WDK) and ensure the matching ghidratrace wheel is "
-                    "installed against the active Python (see "
-                    "requirements-debugger.txt) to enable this test."
+                    "installed against the active Python (see the "
+                    "`debugger` dependency group: `uv sync --group debugger`) "
+                    "to enable this test."
                 ) from launch_err
             raise
 
@@ -1519,6 +1616,60 @@ def run_debugger_live_test(repo_root: Path, mcp_url: str) -> None:
             _ensure_mcp_ok(path, payload)
         print("Debugger live test passed: launched BenchmarkDebug.exe and read trace state.")
     finally:
+        # The target is left stopped at a breakpoint after the reads above.
+        # Windows won't let taskkill terminate a process while it's parked at
+        # a debug event under dbgeng -- taskkill reports "no running instance
+        # of the task" even though tasklist still sees it, and the process
+        # lingers until something releases dbgeng's hold on it. There is no
+        # /debugger/detach endpoint on this in-process TraceRmi surface (that
+        # name only exists on the separate standalone-server debugger proxy,
+        # which isn't involved here). /debugger/resume alone does NOT
+        # reliably release the hold -- confirmed live (2026-07-26) it can
+        # still leave the target un-taskkill-able afterward, and a stuck
+        # target locks any DLL it has loaded (e.g. Benchmark.dll), which
+        # then fails a later reset_benchmark_fixture's /delete_file with
+        # "file is in use". What actually works: kill the local-dbgeng
+        # launcher backend itself (see _terminate_dbgeng_launcher_processes),
+        # which releases dbgeng's grip from the other end -- the target then
+        # either self-exits or becomes immediately killable. Try resume
+        # first anyway (cheap, sometimes sufficient on its own), then the
+        # launcher-backend kill, then the debuggee, in that order.
+        #
+        # That launcher-backend kill has its own real, separate cost: it
+        # severs the TraceRmi connection abruptly, and Ghidra's own
+        # TraceRmiHandler.dispose() (core Debugger plugin code, not ours --
+        # ghidra.app.plugin.core.debug.service.tracermi.TraceRmiHandler)
+        # unconditionally calls DomainObjectAdapterDB.save() on disconnect
+        # with no check for an already-open transaction. If the trace's own
+        # background sync activity (module/register writes) still has a
+        # transaction open at that instant, Ghidra throws `AssertException:
+        # Can't save during transaction` from a background thread (confirmed
+        # live 2026-07-26, via an actual crash dialog), which appears to
+        # leave the trace's disposal incomplete -- the real explanation for
+        # the previously-mysterious "Benchmark.dll is in use" failures with
+        # no process left holding it. This is a pre-existing Ghidra-core
+        # bug, not something this fix introduced: the identical
+        # "Benchmark.dll is in use" symptom was already documented from the
+        # OLD resume-only approach, before this launcher-kill existed.
+        # Tried a settle delay before severing the connection, on the theory
+        # this was a narrow timing race the same way the analogous
+        # program-save race is (see ProgramScriptService.saveWithRetry) --
+        # measured, live, that it made no difference: the lock reproduced on
+        # literally the first debugger cycle after a completely fresh
+        # deploy, delay or no delay. This is not a rare race to narrow; it
+        # reproduces close to every time. Removed the delay since it bought
+        # nothing. There is no known mitigation from this side of the
+        # boundary -- the actual bug is in Ghidra's own TraceRmiHandler, and
+        # fixing it would mean patching Ghidra core, not this plugin. Once
+        # hit, the lock does not clear within the same Ghidra session; only
+        # a full restart has reliably cleared it in testing. See project
+        # memory for the full writeup and the recommendation to report this
+        # upstream.
+        try:
+            _mcp_request(repo_root, mcp_url, "/debugger/resume", method="POST", timeout=10)
+        except Exception:
+            pass
+        _terminate_dbgeng_launcher_processes()
         _terminate_processes_by_name("BenchmarkDebug.exe")
 
 
@@ -1605,7 +1756,31 @@ def _bench_text(parsed: object) -> str:
     return str(parsed)
 
 
+def _bench_envelope_items(parsed: object) -> list | None:
+    """Items from a 7.0.0 list-shaped response, or None if it isn't one.
+
+    The contract is {"<plural>": [...], "count", ...}. Rather than hardcode
+    every plural key, find the single list-valued key alongside a "count" --
+    that combination only occurs in the list envelope.
+    """
+    if not isinstance(parsed, dict) or "count" not in parsed:
+        return None
+    list_keys = [k for k, v in parsed.items() if isinstance(v, list)]
+    if len(list_keys) != 1:
+        return None
+    return parsed[list_keys[0]]
+
+
 def _bench_lines(parsed: object) -> list[str]:
+    """One line per logical item.
+
+    Post-7.0.0 the list tools return records, so "lines" means "items": each
+    record is rendered compactly so `contains` needles still match field values
+    and `min_lines` still counts results.
+    """
+    items = _bench_envelope_items(parsed)
+    if items is not None:
+        return [item if isinstance(item, str) else json.dumps(item) for item in items]
     text = _bench_text(parsed)
     return [line for line in text.splitlines() if line.strip()]
 
@@ -1616,13 +1791,16 @@ def _bench_assert_program_block(repo_root: Path, mcp_url: str, program_path: str
     p_query = {"program": program_path}
 
     _, meta = _bench_get(repo_root, mcp_url, "/get_metadata", p_query)
-    meta_text = _bench_text(meta)
-    if "architecture" in prog and f"Architecture: {prog['architecture']}" not in meta_text:
-        failures.append(f"program.architecture: expected 'Architecture: {prog['architecture']}' in /get_metadata; got snippet: {meta_text[:120]!r}")
-    if "language" in prog and prog["language"] not in meta_text:
-        failures.append(f"program.language: expected '{prog['language']}' in /get_metadata; got snippet: {meta_text[:120]!r}")
-    if "compiler" in prog and f"Compiler: {prog['compiler']}" not in meta_text:
-        failures.append(f"program.compiler: expected 'Compiler: {prog['compiler']}' in /get_metadata")
+    meta_fields = meta if isinstance(meta, dict) else {}
+    for key, field in (("architecture", "architecture"),
+                       ("language", "language"),
+                       ("compiler", "compiler")):
+        if key not in prog:
+            continue
+        actual = str(meta_fields.get(field, ""))
+        if str(prog[key]) != actual:
+            failures.append(
+                f"program.{key}: expected {prog[key]!r} from /get_metadata.{field}; got {actual!r}")
 
     if "function_count_min" in prog:
         _, fc = _bench_get(repo_root, mcp_url, "/get_function_count", p_query)
@@ -1638,11 +1816,15 @@ def _bench_assert_program_block(repo_root: Path, mcp_url: str, program_path: str
 
     if "segments" in prog:
         _, segs = _bench_get(repo_root, mcp_url, "/list_segments", p_query)
-        seg_text = _bench_text(segs)
+        seg_names = {
+            item.get("name") for item in (_bench_envelope_items(segs) or [])
+            if isinstance(item, dict)
+        }
         for spec in prog["segments"]:
-            need = spec["name"] + ":"
-            if need not in seg_text:
-                failures.append(f"program.segments: expected '{need}' in /list_segments")
+            if spec["name"] not in seg_names:
+                failures.append(
+                    f"program.segments: expected a segment named {spec['name']!r}; "
+                    f"got {sorted(n for n in seg_names if n)}")
 
     if "must_contain_strings" in prog:
         _, strs = _bench_get(repo_root, mcp_url, "/list_strings", p_query)
@@ -1657,13 +1839,17 @@ def _bench_assert_function(repo_root: Path, mcp_url: str, program_path: str,
     addr = entry["address"]
     p_query = {"program": program_path, "address": addr}
 
-    # /get_function_by_address gives us the canonical name + thunk flag in text form.
+    # /get_function_by_address returns a record: {name, address, signature,
+    # entry_point, body_start, body_end}.
     _, by_addr = _bench_get(repo_root, mcp_url, "/get_function_by_address", p_query)
-    by_addr_text = _bench_text(by_addr)
+    by_addr_fields = by_addr if isinstance(by_addr, dict) else {}
+    resolved = bool(by_addr_fields.get("name")) and "error" not in by_addr_fields
     if "name" in entry:
-        needle = f"Function: {entry['name']} at"
-        if needle not in by_addr_text:
-            failures.append(f"function@{addr}.name: expected '{needle}' in /get_function_by_address; got: {by_addr_text[:160]!r}")
+        actual_name = str(by_addr_fields.get("name", ""))
+        if actual_name != entry["name"]:
+            failures.append(
+                f"function@{addr}.name: expected {entry['name']!r} from "
+                f"/get_function_by_address.name; got {actual_name!r}")
 
     # /get_function_signature returns JSON with structural fields.
     _, sig = _bench_get(repo_root, mcp_url, "/get_function_signature", p_query)
@@ -1697,24 +1883,25 @@ def _bench_assert_function(repo_root: Path, mcp_url: str, program_path: str,
             if s not in actual:
                 failures.append(f"function@{addr}.callee_names_contains: expected {s!r} in /get_function_signature.callee_names")
     if "return_type_contains" in entry:
-        # Return type appears in the by_addr "Signature:" line.
-        sig_line = ""
-        for line in by_addr_text.splitlines():
-            if line.strip().startswith("Signature:"):
-                sig_line = line
-                break
-        if entry["return_type_contains"] not in sig_line:
-            failures.append(f"function@{addr}.return_type_contains: expected {entry['return_type_contains']!r} in 'Signature:' line; got {sig_line!r}")
+        signature = str(by_addr_fields.get("signature", ""))
+        if entry["return_type_contains"] not in signature:
+            failures.append(
+                f"function@{addr}.return_type_contains: expected "
+                f"{entry['return_type_contains']!r} in /get_function_by_address.signature; "
+                f"got {signature!r}")
     if "is_thunk" in entry:
-        # /get_function_by_address doesn't expose thunk explicitly in text;
-        # rely on the signature presence as a proxy. Treat is_thunk:false
-        # as "we got a signature" — sufficient for the user-authored functions.
-        if entry["is_thunk"] is False and not by_addr_text.strip().startswith("Function:"):
+        # The record has no explicit thunk flag; "did it resolve at all" is the
+        # same proxy the text form used, just read from a field instead of a
+        # line prefix.
+        if entry["is_thunk"] is False and not resolved:
             failures.append(f"function@{addr}.is_thunk=false: function did not resolve via /get_function_by_address")
     if "signature_contains" in entry:
+        signature = str(by_addr_fields.get("signature", ""))
         for needle in entry["signature_contains"]:
-            if needle not in by_addr_text:
-                failures.append(f"function@{addr}.signature_contains: expected {needle!r} in /get_function_by_address")
+            if needle not in signature:
+                failures.append(
+                    f"function@{addr}.signature_contains: expected {needle!r} in "
+                    f"/get_function_by_address.signature; got {signature!r}")
 
     if entry.get("xref_count_to_min", 0) > 0:
         _, xrefs = _bench_get(repo_root, mcp_url, "/get_xrefs_to", p_query)
@@ -1808,7 +1995,13 @@ def _bench_ensure_full_analysis(repo_root: Path, mcp_url: str, program_path: str
     /run_analysis returns in milliseconds — analysis happens on a background
     thread. Without polling for completion the YAML asserts race the analyzer
     and see partial state. Poll /analysis_status.analyzing until it flips
-    back to false (or 60s timeout).
+    back to false (or BENCHMARK_ANALYSIS_TIMEOUT_S timeout).
+
+    The timeout must cover a *cold* install: on a freshly-created Ghidra
+    user-config dir (e.g. the first deploy to a newly-installed Ghidra patch
+    release) the initial analysis of Benchmark.dll + BenchmarkDebug.exe can run
+    well past a minute, so a 60s cap raced the analyzer and produced spurious
+    `param_count: 0` / `undefined` signature failures.
     """
     try:
         _, _ = _mcp_request(repo_root, mcp_url, "/run_analysis",
@@ -1818,7 +2011,7 @@ def _bench_ensure_full_analysis(repo_root: Path, mcp_url: str, program_path: str
         print(f"WARNING: /run_analysis on {program_path} failed: {exc}")
         return
 
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + BENCHMARK_ANALYSIS_TIMEOUT_S
     while time.monotonic() < deadline:
         try:
             _, status = _mcp_request(repo_root, mcp_url, "/analysis_status",
@@ -1828,8 +2021,9 @@ def _bench_ensure_full_analysis(repo_root: Path, mcp_url: str, program_path: str
             continue
         if isinstance(status, dict) and status.get("analyzing") is False:
             return
-        time.sleep(1)
-    print(f"WARNING: /analysis_status on {program_path} still busy after 60s; proceeding anyway")
+        time.sleep(2)
+    print(f"WARNING: /analysis_status on {program_path} still busy after "
+          f"{BENCHMARK_ANALYSIS_TIMEOUT_S}s; proceeding anyway")
 
 
 def run_benchmark_yaml_regression(repo_root: Path, mcp_url: str) -> None:
@@ -1998,8 +2192,8 @@ def install_ghidratrace_for_debugger(
     pip-installed in the launcher's Python, TraceRmi negotiation fails
     with ``VersionMismatchError: Front-end: 12.1, back-end: 12.0`` —
     observed twice in this release cycle. The wheel lives inside the
-    Ghidra install (not on PyPI), so a vanilla ``pip install`` against
-    requirements-debugger.txt can't cover it.
+    Ghidra install (not on PyPI), so a plain ``uv sync --group debugger``
+    can't cover it.
 
     Returns 0 on success / no-op, nonzero on installer failure.
     """
@@ -2042,6 +2236,16 @@ def install_ghidratrace_for_debugger(
     return 0
 
 
+def _file_sha256(path: Path) -> str:
+    """Return the SHA-256 hex digest of a file, streamed so large jars don't
+    load fully into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def install_ghidra_dependencies(
     repo_root: Path,
     ghidra_path: Path,
@@ -2064,9 +2268,20 @@ def install_ghidra_dependencies(
             / ghidra_version
             / f"{artifact_id}-{ghidra_version}.jar"
         )
+        # Skip only when the cached jar is byte-identical to the install's jar.
+        # Presence alone is NOT enough: Ghidra re-releases (and dev builds) can
+        # rebuild jars while keeping the same version string, leaving a stale
+        # jar cached under the same coordinates. A stale test-scoped DB.jar this
+        # way broke the offline Java suite (DomainObjectAdapterDB ->
+        # db.util.ErrorHandler "cannot be resolved") until the cache was
+        # refreshed. Compare content so `ensure-prereqs` self-heals.
         if cached_jar.is_file() and not force:
-            print(f"Skipping already installed dependency: {artifact_id}")
-            continue
+            if _file_sha256(cached_jar) == _file_sha256(jar_path):
+                print(f"Skipping already installed dependency: {artifact_id}")
+                continue
+            print(
+                f"Refreshing stale cached dependency (content changed): {artifact_id}"
+            )
 
         command = [
             maven_command,
@@ -2110,6 +2325,54 @@ def test_write_access(path_to_test: Path) -> bool:
         return False
 
 
+def _has_dependency_group(pyproject: Path, group: str) -> bool:
+    """Return True if ``pyproject.toml`` defines ``group`` under
+    ``[dependency-groups]``.
+
+    A plain substring scan is too loose — the word could appear in a comment or
+    an unrelated section — and too strict, since it wouldn't confirm the entry
+    is one ``uv sync --group <group>`` can actually resolve. Parse the TOML and
+    look for the real key.
+    """
+    if not pyproject.is_file():
+        return False
+
+    try:
+        import tomllib  # Python 3.11+
+    except ModuleNotFoundError:
+        try:
+            import tomli as tomllib  # type: ignore[no-redef]
+        except ModuleNotFoundError:
+            tomllib = None  # type: ignore[assignment]
+
+    if tomllib is not None:
+        try:
+            with pyproject.open("rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, ValueError):
+            return False
+        groups = data.get("dependency-groups")
+        return isinstance(groups, dict) and group in groups
+
+    # Python 3.10 without tomli: fall back to a section-scoped scan so the word
+    # only counts when it's a key inside [dependency-groups].
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    in_section = False
+    key_re = re.compile(rf"^\s*(?:{re.escape(group)}|[\"']{re.escape(group)}[\"'])\s*=")
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0]
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == "[dependency-groups]"
+            continue
+        if in_section and key_re.match(line):
+            return True
+    return False
+
+
 def collect_preflight_issues(
     repo_root: Path,
     ghidra_path: Path,
@@ -2119,12 +2382,12 @@ def collect_preflight_issues(
     strict: bool = False,
     user_base_dir: Path | None = None,
 ) -> list[str]:
-    from .requirements import pip_command
+    from .requirements import ensure_uv_available
 
     issues: list[str] = []
 
     try:
-        pip_command(python_executable)
+        ensure_uv_available()
     except FileNotFoundError as exc:
         issues.append(str(exc))
 
@@ -2143,10 +2406,11 @@ def collect_preflight_issues(
             issues.append(f"Missing required Ghidra dependency: {jar_path}")
 
     if install_debugger:
-        debugger_requirements = repo_root / "requirements-debugger.txt"
-        if not debugger_requirements.is_file():
+        pyproject = repo_root / "pyproject.toml"
+        if not _has_dependency_group(pyproject, "debugger"):
             issues.append(
-                f"Debugger requirements file not found: {debugger_requirements}"
+                "Debugger dependency group not found in pyproject.toml "
+                "(expected a [dependency-groups] 'debugger' entry)"
             )
 
     extensions_dir = ghidra_path / "Extensions" / "Ghidra"
@@ -2175,6 +2439,27 @@ def collect_preflight_issues(
     return issues
 
 
+def build_bridge_wheel(repo_root: Path, *, dry_run: bool = False) -> Path | None:
+    """Build the bridge wheel with ``uv build`` and return its path.
+
+    The Python bridge ships as a wheel (``ghidra_mcp_bridge-*.whl``) rather than
+    a loose ``bridge_mcp_ghidra.py`` script. Returns the newest built wheel, or
+    None on a dry run / when no wheel is produced.
+    """
+    from .requirements import ensure_uv_available
+
+    dist_dir = repo_root / "dist"
+    if dry_run:
+        print(f"DRY RUN: uv build --wheel (-> {dist_dir})")
+        return None
+    uv = ensure_uv_available()
+    subprocess.run([uv, "build", "--wheel"], check=True, cwd=str(repo_root))
+    wheels = sorted(
+        dist_dir.glob("ghidra_mcp_bridge-*.whl"), key=lambda p: p.stat().st_mtime
+    )
+    return wheels[-1] if wheels else None
+
+
 def deploy_to_ghidra(
     repo_root: Path,
     ghidra_path: Path,
@@ -2185,8 +2470,6 @@ def deploy_to_ghidra(
     archive_path = find_plugin_archive(repo_root)
     extensions_dir = ghidra_path / "Extensions" / "Ghidra"
     destination_archive = extensions_dir / archive_path.name
-    bridge_source = repo_root / "bridge_mcp_ghidra.py"
-    requirements_source = repo_root / "requirements.txt"
     dotenv_source = repo_root / ".env"
     user_base_dir = ghidra_user_base_dir()
     mcp_url = resolve_mcp_url(repo_root)
@@ -2202,14 +2485,8 @@ def deploy_to_ghidra(
             f"DRY RUN: remove existing archives matching {extensions_dir / 'GhidraMCP*.zip'}"
         )
         print(f"DRY RUN: copy {archive_path} -> {destination_archive}")
-        if bridge_source.is_file():
-            print(
-                f"DRY RUN: copy {bridge_source} -> {ghidra_path / bridge_source.name}"
-            )
-        if requirements_source.is_file():
-            print(
-                f"DRY RUN: copy {requirements_source} -> {ghidra_path / requirements_source.name}"
-            )
+        build_bridge_wheel(repo_root, dry_run=True)
+        print(f"DRY RUN: copy built bridge wheel -> {ghidra_path}")
         if dotenv_source.is_file():
             print(
                 f"DRY RUN: copy {dotenv_source} -> {ghidra_path / dotenv_source.name}"
@@ -2234,16 +2511,12 @@ def deploy_to_ghidra(
     shutil.copy2(archive_path, destination_archive)
     print(f"Installed plugin archive to {destination_archive}")
 
-    if bridge_source.is_file():
-        bridge_destination = ghidra_path / bridge_source.name
-        bridge_destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(bridge_source, bridge_destination)
-        print(f"Copied bridge to {bridge_destination}")
-
-    if requirements_source.is_file():
-        requirements_destination = ghidra_path / requirements_source.name
-        shutil.copy2(requirements_source, requirements_destination)
-        print(f"Copied requirements to {requirements_destination}")
+    bridge_wheel = build_bridge_wheel(repo_root)
+    if bridge_wheel is not None and bridge_wheel.is_file():
+        wheel_destination = ghidra_path / bridge_wheel.name
+        wheel_destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bridge_wheel, wheel_destination)
+        print(f"Copied bridge wheel to {wheel_destination}")
 
     if dotenv_source.is_file():
         dotenv_destination = ghidra_path / dotenv_source.name
@@ -2280,7 +2553,13 @@ def start_ghidra(ghidra_path: Path, *, repo_root: Path | None = None, dry_run: b
         print_command(command)
         return 0
 
-    subprocess.Popen(command, cwd=ghidra_path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(
+        command,
+        cwd=ghidra_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=os.name == "posix",
+    )
     print(f"Started Ghidra from {executable}")
     return 0
 

@@ -75,6 +75,21 @@ public class AnnotationScanner {
         return Collections.unmodifiableList(descriptors);
     }
 
+    /**
+     * Add a descriptor to the schema output for a route that is registered
+     * directly (e.g. {@code server.createContext(...)}/{@code safeContext(...)})
+     * rather than discovered via {@code @McpTool} reflection. Unlike
+     * {@link #scanService(Object)}, this does NOT add a dispatch entry to
+     * {@link #getEndpoints()} — the caller already owns routing for the path.
+     * Used by {@link ManualToolDescriptors} so hand-registered utility/server/
+     * project routes appear in {@code /mcp/schema} (and therefore the bridge's
+     * dynamic tool discovery) instead of being live-but-invisible.
+     */
+    public void addManualDescriptor(ToolDescriptor descriptor) {
+        descriptors.add(descriptor);
+        descriptors.sort(Comparator.comparing(ToolDescriptor::path));
+    }
+
     /** Generate a JSON schema string describing all discovered tools. */
     public String generateSchema() {
         StringBuilder sb = new StringBuilder();
@@ -155,8 +170,15 @@ public class AnnotationScanner {
                     }
                 }
 
-                // Dry-run support: wrap POST endpoints in a transaction that always rolls back
-                if (isWrite && "true".equalsIgnoreCase(query.get("dry_run")) && programProvider != null) {
+                // Dry-run support: wrap POST endpoints in a transaction that always rolls back.
+                // Must check BOTH the query string and the JSON body -- this project's own
+                // convention (CLAUDE.md "Code Conventions") is that most POST params live in
+                // the body, and a caller following that convention for dry_run too got a SILENT
+                // real write here: the query-only check below was always false, so this whole
+                // rollback branch never ran and every dry_run body param fell through to
+                // method.invoke(...) unguarded. Confirmed live 2026-08-09 on /batch_set_comments
+                // (see reference_dry_run_silently_writes.md).
+                if (isWrite && isDryRunRequested(query, body) && programProvider != null) {
                     Program program = resolveProgramForDryRun(bindings, query);
                     if (program != null) {
                         int tx = program.startTransaction("[DRY RUN] " + tool.path());
@@ -180,6 +202,20 @@ public class AnnotationScanner {
                 return Response.err("Error invoking " + tool.path() + ": " + e.getMessage());
             }
         };
+    }
+
+    /**
+     * True if the caller asked for a dry run, whether "dry_run" arrived as a query
+     * param (?dry_run=true, what the Python bridge's registry.py synthesizes) or as
+     * a JSON body field (what a direct-HTTP caller sends when it follows this
+     * project's own "POST params go in the body" convention).
+     */
+    private static boolean isDryRunRequested(Map<String, String> query, Map<String, Object> body) {
+        if ("true".equalsIgnoreCase(query.get("dry_run"))) return true;
+        Object raw = body != null ? body.get("dry_run") : null;
+        if (raw instanceof Boolean b) return b;
+        if (raw instanceof String s) return "true".equalsIgnoreCase(s);
+        return false;
     }
 
     /**
@@ -226,7 +262,14 @@ public class AnnotationScanner {
     }
 
     private static Object resolveQueryParam(ParamBinding binding, Map<String, String> query) {
+        // Try canonical name first, then aliases
         String value = query.get(binding.param.value());
+        if (value == null && binding.aliases != null) {
+            for (String alias : binding.aliases) {
+                value = query.get(alias);
+                if (value != null) break;
+            }
+        }
         Class<?> type = binding.javaType;
         String def = binding.param.defaultValue();
         boolean hasDef = !NO_DEFAULT.equals(def);
@@ -241,7 +284,13 @@ public class AnnotationScanner {
             return parseIntSafe(value, defaultVal);
 
         } else if (type == Integer.class) {
-            if (value == null || value.isEmpty()) return null;
+            if (value == null || value.isEmpty()) {
+                if (hasDef) {
+                    try { return Integer.valueOf(def); }
+                    catch (NumberFormatException e) { return null; }
+                }
+                return null;
+            }
             try { return Integer.parseInt(value); } catch (NumberFormatException e) { return null; }
 
         } else if (type == boolean.class) {
@@ -250,7 +299,9 @@ public class AnnotationScanner {
             return "true".equalsIgnoreCase(value);
 
         } else if (type == Boolean.class) {
-            if (value == null || value.isEmpty()) return null;
+            if (value == null || value.isEmpty()) {
+                return hasDef ? Boolean.valueOf(def) : null;
+            }
             return Boolean.parseBoolean(value);
 
         } else if (type == double.class) {
@@ -268,7 +319,14 @@ public class AnnotationScanner {
 
     @SuppressWarnings("unchecked")
     private static Object resolveBodyParam(ParamBinding binding, Map<String, Object> body) {
+        // Try canonical name first, then aliases
         Object raw = body.get(binding.param.value());
+        if (raw == null && binding.aliases != null) {
+            for (String alias : binding.aliases) {
+                raw = body.get(alias);
+                if (raw != null) break;
+            }
+        }
         Class<?> type = binding.javaType;
         String def = binding.param.defaultValue();
         boolean hasDef = !NO_DEFAULT.equals(def);
@@ -287,7 +345,13 @@ public class AnnotationScanner {
             return JsonHelper.getInt(raw, defaultVal);
 
         } else if (type == Integer.class) {
-            if (raw == null) return null;
+            if (raw == null) {
+                if (hasDef) {
+                    try { return Integer.valueOf(def); }
+                    catch (NumberFormatException e) { return null; }
+                }
+                return null;
+            }
             return JsonHelper.getInt(raw, 0);
 
         } else if (type == long.class) {
@@ -304,7 +368,9 @@ public class AnnotationScanner {
             return "true".equalsIgnoreCase(String.valueOf(raw));
 
         } else if (type == Boolean.class) {
-            if (raw == null) return null;
+            if (raw == null) {
+                return hasDef ? Boolean.valueOf(def) : null;
+            }
             if (raw instanceof Boolean b) return b;
             return Boolean.parseBoolean(String.valueOf(raw));
 
@@ -379,7 +445,8 @@ public class AnnotationScanner {
                 !NO_DEFAULT.equals(binding.param.defaultValue()),
                 NO_DEFAULT.equals(binding.param.defaultValue()) ? null : binding.param.defaultValue(),
                 binding.param.description(),
-                binding.param.paramType()    // NEW
+                binding.param.paramType(),
+                binding.param.allowEmpty()
             ));
         }
         return new ToolDescriptor(tool.path(), tool.method(), tool.description(),
@@ -432,7 +499,8 @@ public class AnnotationScanner {
 
     /** Describes a tool parameter for schema generation. */
     public record ParamDescriptor(String name, String type, String source,
-            boolean optional, String defaultValue, String description, String paramType) {
+            boolean optional, String defaultValue, String description, String paramType,
+            boolean allowEmpty) {
 
         /** Serialize to JSON. */
         public String toJson() {
@@ -450,6 +518,11 @@ public class AnnotationScanner {
             if (paramType != null && !paramType.isEmpty()) {
                 sb.append(", \"param_type\": ").append(jsonStr(paramType));
             }
+            // Only emitted when true: the bridge drops "" arguments unless a
+            // parameter declares that empty carries meaning.
+            if (allowEmpty) {
+                sb.append(", \"allow_empty\": true");
+            }
             sb.append("}");
             return sb.toString();
         }
@@ -464,5 +537,9 @@ public class AnnotationScanner {
     // Internal binding record
     // ==================================================================
 
-    private record ParamBinding(Param param, Class<?> javaType) {}
+    private record ParamBinding(Param param, Class<?> javaType, String[] aliases) {
+        ParamBinding(Param param, Class<?> javaType) {
+            this(param, javaType, param.aliases());
+        }
+    }
 }

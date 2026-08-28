@@ -5,7 +5,6 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -46,11 +45,23 @@ public final class JsonHelper {
         return GSON.toJson(Map.of("error", message != null ? message : "Unknown error"));
     }
 
-    /** Parse JSON from an InputStream (for HTTP request bodies). */
+    /**
+     * Parse JSON from an InputStream (for HTTP request bodies). The read is
+     * bounded to {@link SecurityConfig#MAX_REQUEST_BODY_BYTES} regardless of
+     * any declared Content-Length, so a chunked or mis-declared oversized body
+     * cannot force an unbounded allocation. An overreading body yields an empty
+     * map (fail-safe: the endpoint then errors on the missing required params).
+     */
     @SuppressWarnings("unchecked")
     public static Map<String, Object> parseBody(InputStream input) {
-        try (InputStreamReader reader = new InputStreamReader(input, StandardCharsets.UTF_8)) {
-            Map<String, Object> result = GSON.fromJson(reader, LinkedHashMap.class);
+        try {
+            int cap = (int) SecurityConfig.MAX_REQUEST_BODY_BYTES;
+            byte[] bytes = input.readNBytes(cap + 1);
+            if (bytes.length > SecurityConfig.MAX_REQUEST_BODY_BYTES) {
+                return new LinkedHashMap<>();  // oversized — refuse rather than allocate more
+            }
+            Map<String, Object> result = GSON.fromJson(
+                new String(bytes, StandardCharsets.UTF_8), LinkedHashMap.class);
             return result != null ? result : new LinkedHashMap<>();
         } catch (Exception e) {
             return new LinkedHashMap<>();
@@ -75,7 +86,29 @@ public final class JsonHelper {
     public static int getInt(Object obj, int defaultValue) {
         if (obj instanceof Number n) return n.intValue();
         if (obj instanceof String s) {
-            try { return Integer.parseInt(s); } catch (NumberFormatException e) { return defaultValue; }
+            try {
+                return Integer.parseInt(s);
+            } catch (NumberFormatException e) {
+                // toMapStringList (below) stringifies every value with
+                // String.valueOf(Object), and Gson parses JSON numbers as
+                // Double -- so an integer field that passed through THAT
+                // path (the bare-array fallback in
+                // ServiceUtils.convertToMapList, not the direct-object path)
+                // arrives here as "16.0", not "16". Integer.parseInt rejects
+                // the decimal point outright. Fall back to a double parse so
+                // a caller reading an int out of a Map<String,String> built
+                // that way is not silently handed the default instead of
+                // the real value -- found via emulate_function's
+                // read_memory_after: identical requests succeeded when
+                // wrapped as {"regions":[...]} (bypasses toMapStringList's
+                // stringification) and failed, silently, sent as a bare
+                // array with the SAME integer field.
+                try {
+                    return (int) Double.parseDouble(s);
+                } catch (NumberFormatException e2) {
+                    return defaultValue;
+                }
+            }
         }
         return defaultValue;
     }

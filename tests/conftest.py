@@ -5,9 +5,17 @@ GhidraMCP Test Configuration and Fixtures
 import json
 import os
 import re
+import sys
 import pytest
 import requests
 from pathlib import Path
+
+# The bridge package lives under python/ (split out of the historical
+# single-file bridge_mcp_ghidra.py). Make it importable as `bridge_mcp_ghidra`
+# even when tests run without an editable `uv sync` install.
+_PYTHON_DIR = Path(__file__).resolve().parent.parent / "python"
+if str(_PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_DIR))
 
 
 # =============================================================================
@@ -160,6 +168,33 @@ def program_loaded(server_url, server_available):
         return True
     except requests.RequestException:
         return False
+
+
+@pytest.fixture(scope="session")
+def current_program(server_url, server_available):
+    """Path of the program the server currently has focused, or None.
+
+    Resolved from `/list_open_programs` (JSON, has `is_current`). Do NOT use
+    `/get_metadata` for this: it returns plain text, so `.json()` raises and
+    every caller that wrapped it in `except ValueError` silently skipped —
+    which is why the live batch-scoring and listing-consistency regressions
+    never actually ran.
+    """
+    if not server_available:
+        return None
+    try:
+        resp = requests.get(f"{server_url}/list_open_programs", timeout=10)
+        if resp.status_code != 200:
+            return None
+        programs = resp.json().get("programs") or []
+    except (requests.RequestException, ValueError):
+        return None
+    if not programs:
+        return None
+    for p in programs:
+        if p.get("is_current"):
+            return p.get("path") or p.get("name")
+    return programs[0].get("path") or programs[0].get("name")
 
 
 @pytest.fixture

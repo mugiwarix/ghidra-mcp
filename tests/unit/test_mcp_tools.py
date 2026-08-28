@@ -26,19 +26,19 @@ class TestTransportModes(unittest.TestCase):
         """Transport mode should be set after module init (may auto-connect)."""
         import bridge_mcp_ghidra as bridge
 
-        self.assertIn(bridge._transport_mode, ("none", "uds", "tcp"))
+        self.assertIn(bridge.state._transport_mode, ("none", "uds", "tcp"))
 
     def test_do_request_raises_when_disconnected(self):
         """do_request should raise ConnectionError when no transport active."""
         import bridge_mcp_ghidra as bridge
 
-        old_mode = bridge._transport_mode
-        bridge._transport_mode = "none"
+        old_mode = bridge.state._transport_mode
+        bridge.state._transport_mode = "none"
         try:
             with self.assertRaises(ConnectionError):
                 bridge.do_request("GET", "/test")
         finally:
-            bridge._transport_mode = old_mode
+            bridge.state._transport_mode = old_mode
 
 
 class TestStaticTools(unittest.TestCase):
@@ -74,7 +74,7 @@ class TestToolGroupManagement(unittest.TestCase):
     def test_lazy_loading_disabled_by_default(self):
         import bridge_mcp_ghidra as bridge
 
-        self.assertFalse(bridge._lazy_mode)
+        self.assertFalse(bridge.state._lazy_mode)
 
     def test_list_tool_groups_registered(self):
         import bridge_mcp_ghidra as bridge
@@ -189,11 +189,9 @@ class TestToolGroupManagement(unittest.TestCase):
                 loaded = bridge._load_group("grp_beta")
 
             self.assertEqual(loaded, ["issue_212_lazy_valid_after"])
-            self.assertIn("grp_beta", bridge._loaded_groups)
-            self.assertIn("issue_212_lazy_valid_after", bridge._dynamic_tool_names)
-            self.assertNotIn(
-                "issue_212_lazy_bad_signature", bridge._dynamic_tool_names
-            )
+            self.assertIn("grp_beta", bridge.state._loaded_groups)
+            self.assertIn("issue_212_lazy_valid_after", bridge.state._dynamic_tool_names)
+            self.assertNotIn("issue_212_lazy_bad_signature", bridge.state._dynamic_tool_names)
             message = mock_stderr.write.call_args.args[0]
             self.assertIn("1 tool(s) failed to register", message)
             self.assertIn("issue_212_lazy_bad_signature", message)
@@ -231,31 +229,30 @@ class TestConnectInstance(unittest.TestCase):
             request_context=SimpleNamespace(session=session),
         )
 
-        old_lazy_mode = bridge._lazy_mode
-        old_active_socket = bridge._active_socket
-        old_active_tcp = bridge._active_tcp
-        old_transport_mode = bridge._transport_mode
-        old_connected_project = bridge._connected_project
-        old_dynamic_names = list(bridge._dynamic_tool_names)
-        old_full_schema = list(bridge._full_schema)
-        old_loaded_groups = set(bridge._loaded_groups)
+        old_lazy_mode = bridge.state._lazy_mode
+        old_active_socket = bridge.state._active_socket
+        old_active_tcp = bridge.state._active_tcp
+        old_transport_mode = bridge.state._transport_mode
+        old_connected_project = bridge.state._connected_project
+        old_dynamic_names = list(bridge.state._dynamic_tool_names)
+        old_full_schema = list(bridge.state._full_schema)
+        old_loaded_groups = set(bridge.state._loaded_groups)
 
         try:
-            bridge._lazy_mode = False
-            with mock.patch.object(
-                bridge,
-                "discover_instances",
-                return_value=[
-                    {"project": "TestProject", "socket": "/tmp/test.sock", "pid": 42}
-                ],
-            ), mock.patch.object(
-                bridge,
-                "do_request",
-                return_value=(json.dumps(schema), 200),
+            bridge.state._lazy_mode = False
+            with (
+                mock.patch.object(
+                    bridge.discovery,
+                    "discover_instances",
+                    return_value=[{"project": "TestProject", "socket": "/tmp/test.sock", "pid": 42}],
+                ),
+                mock.patch.object(
+                    bridge.transport,
+                    "do_request",
+                    return_value=(json.dumps(schema), 200),
+                ),
             ):
-                result = json.loads(
-                    asyncio.run(bridge.connect_instance("TestProject", ctx=ctx))
-                )
+                result = json.loads(asyncio.run(bridge.connect_instance("TestProject", ctx=ctx)))
 
             self.assertTrue(result["connected"])
             self.assertEqual(result["tools_registered"], 2)
@@ -264,17 +261,156 @@ class TestConnectInstance(unittest.TestCase):
             self.assertEqual(result["note"], "Loaded all 2 tools on connect.")
             session.send_tool_list_changed.assert_awaited_once()
         finally:
-            for name in list(bridge._dynamic_tool_names):
+            for name in list(bridge.state._dynamic_tool_names):
                 bridge.mcp._tool_manager._tools.pop(name, None)
-            bridge._dynamic_tool_names[:] = old_dynamic_names
-            bridge._full_schema[:] = old_full_schema
-            bridge._loaded_groups.clear()
-            bridge._loaded_groups.update(old_loaded_groups)
-            bridge._lazy_mode = old_lazy_mode
-            bridge._active_socket = old_active_socket
-            bridge._active_tcp = old_active_tcp
-            bridge._transport_mode = old_transport_mode
-            bridge._connected_project = old_connected_project
+            bridge.state._dynamic_tool_names[:] = old_dynamic_names
+            bridge.state._full_schema[:] = old_full_schema
+            bridge.state._loaded_groups.clear()
+            bridge.state._loaded_groups.update(old_loaded_groups)
+            bridge.state._lazy_mode = old_lazy_mode
+            bridge.state._active_socket = old_active_socket
+            bridge.state._active_tcp = old_active_tcp
+            bridge.state._transport_mode = old_transport_mode
+            bridge.state._connected_project = old_connected_project
+
+
+class TestToolsChangedFanout(unittest.TestCase):
+    def test_worker_notification_fans_out_to_all_sessions(self):
+        import bridge_mcp_ghidra as bridge
+
+        session1 = SimpleNamespace(send_tool_list_changed=mock.AsyncMock())
+        session2 = SimpleNamespace(send_tool_list_changed=mock.AsyncMock())
+
+        async def scenario():
+            ctx1 = SimpleNamespace(
+                _request_context=object(),
+                request_context=SimpleNamespace(session=session1),
+            )
+            ctx2 = SimpleNamespace(
+                _request_context=object(),
+                request_context=SimpleNamespace(session=session2),
+            )
+            bridge.state.remember_tools_changed_context(ctx1)
+            bridge.state.remember_tools_changed_context(ctx2)
+            bridge.state.notify_tools_changed_from_worker()
+            await asyncio.sleep(0)
+
+        old_targets = list(bridge.state._tools_changed_targets)
+        try:
+            bridge.state._tools_changed_targets.clear()
+            asyncio.run(scenario())
+        finally:
+            bridge.state._tools_changed_targets[:] = old_targets
+
+        session1.send_tool_list_changed.assert_awaited_once()
+        session2.send_tool_list_changed.assert_awaited_once()
+
+
+class TestToolsListCapturesSession(unittest.TestCase):
+    """tools/list must register the notification target.
+
+    Registration used to happen only inside connect_instance/load_tool_group/
+    unload_tool_group/import_file. That made the background auto-connect retry
+    (which exists for a bridge started BEFORE Ghidra) notify an EMPTY target
+    list: the client is never told the other ~238 tools arrived, so the whole
+    session shows 35 of 273 tools while Ghidra is healthy. Every MCP client
+    lists tools right after initialize, so capturing there is what guarantees a
+    target exists before the retry can win.
+    """
+
+    @staticmethod
+    def _run_list_tools(session):
+        import bridge_mcp_ghidra as bridge
+        from mcp.server.lowlevel import server as lowlevel
+
+        async def scenario():
+            token = lowlevel.request_ctx.set(SimpleNamespace(session=session))
+            try:
+                return await bridge.mcp.list_tools()
+            finally:
+                lowlevel.request_ctx.reset(token)
+
+        return asyncio.run(scenario())
+
+    def test_tools_list_registers_notification_target(self):
+        import bridge_mcp_ghidra as bridge
+
+        session = SimpleNamespace(send_tool_list_changed=mock.AsyncMock())
+        old_targets = list(bridge.state._tools_changed_targets)
+        try:
+            bridge.state._tools_changed_targets.clear()
+            tools = self._run_list_tools(session)
+            self.assertTrue(tools, "tools/list must still return the tool list")
+            self.assertEqual(len(bridge.state._tools_changed_targets), 1)
+            self.assertIs(bridge.state._tools_changed_targets[0][1], session)
+        finally:
+            bridge.state._tools_changed_targets[:] = old_targets
+
+    def test_late_registration_notifies_a_client_that_only_listed_tools(self):
+        """The end-to-end shape of the bug: list tools, then register late."""
+        import bridge_mcp_ghidra as bridge
+        from mcp.server.lowlevel import server as lowlevel
+
+        session = SimpleNamespace(send_tool_list_changed=mock.AsyncMock())
+
+        async def scenario():
+            token = lowlevel.request_ctx.set(SimpleNamespace(session=session))
+            try:
+                await bridge.mcp.list_tools()
+            finally:
+                lowlevel.request_ctx.reset(token)
+            # Ghidra arrives later; the retry thread notifies from a worker.
+            await asyncio.get_running_loop().run_in_executor(
+                None, bridge.state.notify_tools_changed_from_worker
+            )
+            await asyncio.sleep(0)
+
+        old_targets = list(bridge.state._tools_changed_targets)
+        try:
+            bridge.state._tools_changed_targets.clear()
+            asyncio.run(scenario())
+        finally:
+            bridge.state._tools_changed_targets[:] = old_targets
+
+        session.send_tool_list_changed.assert_awaited_once()
+
+    def test_tools_list_without_request_context_still_works(self):
+        """A direct call (no active request) must not raise."""
+        import bridge_mcp_ghidra as bridge
+
+        old_targets = list(bridge.state._tools_changed_targets)
+        try:
+            bridge.state._tools_changed_targets.clear()
+            tools = asyncio.run(bridge.mcp.list_tools())
+            self.assertTrue(tools)
+            self.assertEqual(bridge.state._tools_changed_targets, [])
+        finally:
+            bridge.state._tools_changed_targets[:] = old_targets
+
+    def test_lowlevel_handler_uses_the_capturing_wrapper(self):
+        """Patching only FastMCP.list_tools would miss the real request path."""
+        import bridge_mcp_ghidra as bridge
+        import mcp.types as types
+        from mcp.server.lowlevel import server as lowlevel
+
+        session = SimpleNamespace(send_tool_list_changed=mock.AsyncMock())
+        handler = bridge.mcp._mcp_server.request_handlers[types.ListToolsRequest]
+
+        async def scenario():
+            token = lowlevel.request_ctx.set(SimpleNamespace(session=session))
+            try:
+                return await handler(types.ListToolsRequest(method="tools/list"))
+            finally:
+                lowlevel.request_ctx.reset(token)
+
+        old_targets = list(bridge.state._tools_changed_targets)
+        try:
+            bridge.state._tools_changed_targets.clear()
+            result = asyncio.run(scenario())
+            self.assertTrue(result.root.tools)
+            self.assertEqual(len(bridge.state._tools_changed_targets), 1)
+        finally:
+            bridge.state._tools_changed_targets[:] = old_targets
 
 
 class TestEndpointTimeouts(unittest.TestCase):
@@ -311,7 +447,9 @@ class TestSchemaFormat(unittest.TestCase):
                 "str_param": {"type": "string"},
                 "int_param": {"type": "integer"},
                 "bool_param": {"type": "boolean"},
-                "num_param": {"type": "number"},
+                # `program` also makes the endpoint eligible for the synthetic
+                # dry_run -- the server can only roll back a scoped write.
+                "program": {"type": "string", "source": "query"},
             },
             "required": ["str_param"],
         }

@@ -6,13 +6,28 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.xebyte.core.AnnotationScanner;
 import com.xebyte.core.EndpointDef;
+import com.xebyte.core.McpTool;
+import com.xebyte.core.Param;
+import com.xebyte.core.ParamSource;
 import com.xebyte.core.ProgramProvider;
+import com.xebyte.core.Response;
+import ghidra.program.model.listing.Program;
 import junit.framework.TestCase;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * Pure-reflection tests for {@link AnnotationScanner}.
@@ -172,5 +187,158 @@ public class AnnotationScannerOfflineTest extends TestCase {
             }
         }
         assertTrue("Schema param descriptors missing required fields: " + broken, broken.isEmpty());
+    }
+
+    /**
+     * Boxed Integer/Boolean params with {@code defaultValue} must return the
+     * parsed default — not {@code null} — when no value is supplied, for both
+     * QUERY and BODY sources.
+     *
+     * <p>This is a regression test for H13: the {@code Integer.class} and
+     * {@code Boolean.class} branches in {@code resolveQueryParam} /
+     * {@code resolveBodyParam} were ignoring {@code hasDef}/{@code def} and
+     * returning {@code null}, unlike the primitive {@code int}/{@code boolean}
+     * branches which already honored it.
+     */
+    public void testBoxedParamHonorsDefaultValue() throws Exception {
+        BoxedDefaultFixture fixture = new BoxedDefaultFixture();
+        AnnotationScanner fixtureScanner = new AnnotationScanner(fixture);
+        List<EndpointDef> endpoints = fixtureScanner.getEndpoints();
+
+        // Find GET (QUERY source) and POST (BODY source) handlers
+        EndpointDef getEndpoint = null;
+        EndpointDef postEndpoint = null;
+        for (EndpointDef ep : endpoints) {
+            if ("/test_boxed_query".equals(ep.path())) getEndpoint = ep;
+            if ("/test_boxed_body".equals(ep.path()))  postEndpoint = ep;
+        }
+        assertNotNull("GET fixture endpoint not found", getEndpoint);
+        assertNotNull("POST fixture endpoint not found", postEndpoint);
+
+        // Invoke GET handler with no query parameters
+        Map<String, String> emptyQuery = Collections.emptyMap();
+        Map<String, Object> emptyBody  = Collections.emptyMap();
+        getEndpoint.handler().handle(emptyQuery, emptyBody);
+
+        assertEquals("QUERY: boxed Integer with defaultValue=\"0\" and absent value should return 0",
+            Integer.valueOf(0), fixture.lastLength);
+        assertEquals("QUERY: boxed Boolean with defaultValue=\"true\" and absent value should return Boolean.TRUE",
+            Boolean.TRUE, fixture.lastStrict);
+
+        // Invoke POST handler with no body parameters
+        postEndpoint.handler().handle(emptyQuery, emptyBody);
+
+        assertEquals("BODY: boxed Integer with defaultValue=\"5\" and absent value should return 5",
+            Integer.valueOf(5), fixture.lastBodyLength);
+        assertEquals("BODY: boxed Boolean with defaultValue=\"false\" and absent value should return Boolean.FALSE",
+            Boolean.FALSE, fixture.lastBodyStrict);
+    }
+
+    /**
+     * Tiny fixture service scanned by {@link #testBoxedParamHonorsDefaultValue}.
+     * The two {@code @McpTool} methods capture their resolved arguments so the test
+     * can assert the values without needing to parse the Response JSON.
+     */
+    static class BoxedDefaultFixture {
+
+        // Captured by the QUERY handler
+        volatile Integer lastLength;
+        volatile Boolean lastStrict;
+
+        // Captured by the BODY handler
+        volatile Integer lastBodyLength;
+        volatile Boolean lastBodyStrict;
+
+        @McpTool(path = "/test_boxed_query", method = "GET",
+                 description = "Fixture: boxed Integer/Boolean via QUERY source")
+        public Response queryBoxed(
+                @Param(value = "length", defaultValue = "0") Integer length,
+                @Param(value = "strict", defaultValue = "true") Boolean strict) {
+            lastLength = length;
+            lastStrict = strict;
+            return Response.ok("ok");
+        }
+
+        @McpTool(path = "/test_boxed_body", method = "POST",
+                 description = "Fixture: boxed Integer/Boolean via BODY source")
+        public Response bodyBoxed(
+                @Param(value = "length", source = ParamSource.BODY, defaultValue = "5") Integer length,
+                @Param(value = "strict", source = ParamSource.BODY, defaultValue = "false") Boolean strict) {
+            lastBodyLength = length;
+            lastBodyStrict = strict;
+            return Response.ok("ok");
+        }
+    }
+
+    /**
+     * Regression test for the 2026-08-09 incident: a raw-HTTP caller that follows this
+     * project's own "POST params go in the JSON body" convention (CLAUDE.md "Code
+     * Conventions") and puts {@code dry_run} in the body got a REAL write with a
+     * response that still looked like a preview. Root cause: the dry-run gate at
+     * {@code AnnotationScanner.createHandler} checked only {@code query.get("dry_run")},
+     * never the parsed body map, so body-supplied dry_run was silently ignored and the
+     * rollback-wrapped branch never ran. Confirmed live against /batch_set_comments,
+     * where it overwrote a verified-good plate comment before being caught and reverted.
+     *
+     * <p>This exercises the real dry-run wrapper end-to-end: a mocked {@link Program}
+     * stands in for the transaction the wrapper starts/rolls back, and the fixture's
+     * write method itself is invoked either way (the wrapper can only undo Ghidra
+     * transaction state, not arbitrary Java side effects) -- what distinguishes a
+     * genuine dry run is that {@code endTransaction} is called with {@code commit=false}.
+     */
+    public void testDryRunHonoredFromJsonBody() throws Exception {
+        DryRunWriteFixture fixture = new DryRunWriteFixture();
+        Program program = mock(Program.class);
+        when(program.startTransaction(org.mockito.ArgumentMatchers.anyString())).thenReturn(42);
+
+        ProgramProvider provider = mock(ProgramProvider.class);
+        when(provider.getProgram("Test.dll")).thenReturn(program);
+
+        AnnotationScanner fixtureScanner = new AnnotationScanner(provider, new Object[] { fixture });
+        EndpointDef endpoint = null;
+        for (EndpointDef ep : fixtureScanner.getEndpoints()) {
+            if ("/test_dry_run_write".equals(ep.path())) endpoint = ep;
+        }
+        assertNotNull("Fixture endpoint not found", endpoint);
+
+        // dry_run supplied ONLY in the JSON body -- exactly the shape that was silently
+        // ignored before the fix (query still carries "program" so the wrapper CAN
+        // resolve a Program to roll back on; only dry_run itself is body-only).
+        Map<String, String> query = new HashMap<>();
+        query.put("program", "Test.dll");
+        Map<String, Object> body = new HashMap<>();
+        body.put("dry_run", Boolean.TRUE);
+        endpoint.handler().handle(query, body);
+
+        assertTrue("Fixture method must still be invoked under dry-run (only the transaction is rolled back)",
+            fixture.invoked);
+        verify(program).endTransaction(anyInt(), eq(false));
+
+        // Control: no dry_run anywhere -> real invocation, no dry-run rollback wrapper.
+        Program program2 = mock(Program.class);
+        ProgramProvider provider2 = mock(ProgramProvider.class);
+        when(provider2.getProgram("Test.dll")).thenReturn(program2);
+        DryRunWriteFixture fixture2 = new DryRunWriteFixture();
+        AnnotationScanner fixtureScanner2 = new AnnotationScanner(provider2, new Object[] { fixture2 });
+        EndpointDef endpoint2 = null;
+        for (EndpointDef ep : fixtureScanner2.getEndpoints()) {
+            if ("/test_dry_run_write".equals(ep.path())) endpoint2 = ep;
+        }
+        endpoint2.handler().handle(query, Collections.emptyMap());
+        assertTrue("Fixture method must be invoked on a real (non-dry-run) call", fixture2.invoked);
+        verify(program2, never()).endTransaction(anyInt(), eq(false));
+    }
+
+    /** Tiny fixture service scanned by {@link #testDryRunHonoredFromJsonBody}. */
+    static class DryRunWriteFixture {
+        volatile boolean invoked;
+
+        @McpTool(path = "/test_dry_run_write", method = "POST",
+                 description = "Fixture: a write endpoint used to prove dry_run routing")
+        public Response write(
+                @Param(value = "program", defaultValue = "") String program) {
+            invoked = true;
+            return Response.ok("wrote");
+        }
     }
 }

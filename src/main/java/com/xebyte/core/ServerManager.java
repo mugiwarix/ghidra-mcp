@@ -117,6 +117,7 @@ public class ServerManager {
             java.util.function.Consumer<UdsHttpServer> guiEndpoints) throws IOException {
         Path socketDir = getSocketDir();
         Files.createDirectories(socketDir);
+        hardenSocketDir(socketDir);
         Path socketPath = socketDir.resolve(getSocketName());
 
         server = new UdsHttpServer(socketPath);
@@ -131,7 +132,10 @@ public class ServerManager {
                     String json = ep.handler().handle(query, body).toJson();
                     sendJsonResponse(exchange, json);
                 } catch (Exception e) {
-                    sendJsonResponse(exchange, Response.err(e.getMessage()).toJson());
+                    // Uncaught handler failure: log full detail, return generic.
+                    Msg.error(ServerManager.class, "Unhandled error on " + ep.path(), e);
+                    sendJsonResponse(exchange, Response.err(
+                        "Internal server error. See the Ghidra application log for details.").toJson());
                 }
             });
         }
@@ -305,12 +309,75 @@ public class ServerManager {
         }
     }
 
+    /**
+     * Verify the socket directory is owned by the current user and lock it
+     * to mode {@code 0700}. The {@code /tmp/ghidra-mcp-<user>} fallback path
+     * is predictable; on a multi-user host an attacker can pre-create it
+     * (sticky {@code /tmp} allows new entries) and {@code createDirectories}
+     * silently succeeds on an existing dir regardless of owner. Binding a
+     * socket inside an attacker-owned directory lets them delete/replace it
+     * and intercept bridge connections — full unauthenticated access to the
+     * RE endpoints. Refuse to start in that case.
+     * <p>
+     * No-op on platforms without POSIX file attributes (Windows).
+     */
+    private void hardenSocketDir(Path socketDir) throws IOException {
+        if (!socketDir.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            return;
+        }
+        java.nio.file.attribute.PosixFileAttributes attrs =
+            Files.readAttributes(socketDir, java.nio.file.attribute.PosixFileAttributes.class);
+        String owner = attrs.owner().getName();
+        String me = System.getProperty("user.name");
+        if (me != null && !me.equals(owner)) {
+            throw new IOException(
+                "Refusing to bind UDS socket: directory " + socketDir
+                + " is owned by '" + owner + "' (expected '" + me + "'). "
+                + "This may be a socket-hijack attempt. Remove the directory "
+                + "or set XDG_RUNTIME_DIR to a private location.");
+        }
+        try {
+            Files.setPosixFilePermissions(socketDir,
+                java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
+        } catch (IOException e) {
+            Msg.warn(this, "Could not chmod socket dir " + socketDir
+                + " to 0700: " + e.getMessage());
+        }
+    }
+
     private Path getSocketDir() {
-        String xdg = System.getenv("XDG_RUNTIME_DIR");
-        if (xdg != null && !xdg.isEmpty()) return Path.of(xdg, "ghidra-mcp");
-        String tmpdir = System.getenv("TMPDIR");
-        String user = System.getProperty("user.name", "unknown");
-        if (tmpdir != null && !tmpdir.isEmpty()) return Path.of(tmpdir, "ghidra-mcp-" + user);
+        return resolveSocketDir(
+            System.getenv("XDG_RUNTIME_DIR"),
+            System.getenv("TMPDIR"),
+            System.getProperty("java.io.tmpdir"),
+            System.getProperty("user.name", "unknown"));
+    }
+
+    /**
+     * Resolve the UDS socket directory: XDG_RUNTIME_DIR, then TMPDIR, then
+     * java.io.tmpdir, then literal /tmp.
+     *
+     * The java.io.tmpdir step matters on Windows, where TMPDIR is unset and
+     * the literal "/tmp" is drive-relative: it resolves against the JVM's
+     * working drive (e.g. F:\tmp when Ghidra runs from F:), which a bridge
+     * running from another drive never scans. java.io.tmpdir honors %TEMP%,
+     * giving both sides the same absolute location; the Python side lists
+     * %TEMP%\ghidra-mcp-&lt;user&gt; among its discovery candidates.
+     */
+    public static Path resolveSocketDir(String xdgRuntimeDir, String tmpdirEnv,
+            String javaIoTmpdir, String user) {
+        if (xdgRuntimeDir != null && !xdgRuntimeDir.isEmpty()) {
+            return Path.of(xdgRuntimeDir, "ghidra-mcp");
+        }
+        if (user == null || user.isEmpty()) {
+            user = "unknown";
+        }
+        if (tmpdirEnv != null && !tmpdirEnv.isEmpty()) {
+            return Path.of(tmpdirEnv, "ghidra-mcp-" + user);
+        }
+        if (javaIoTmpdir != null && !javaIoTmpdir.isEmpty()) {
+            return Path.of(javaIoTmpdir, "ghidra-mcp-" + user);
+        }
         return Path.of("/tmp", "ghidra-mcp-" + user);
     }
 

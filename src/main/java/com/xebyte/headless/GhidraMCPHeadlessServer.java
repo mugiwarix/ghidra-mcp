@@ -21,9 +21,11 @@ import com.xebyte.core.AnnotationScanner;
 import com.xebyte.core.EndpointDef;
 import com.xebyte.core.JsonHelper;
 import com.xebyte.core.ProgramProvider;
+import com.xebyte.core.SecurityConfig;
 import com.xebyte.core.ThreadingStrategy;
 import ghidra.GhidraApplicationLayout;
 import ghidra.GhidraLaunchable;
+import ghidra.app.script.GhidraScriptUtil;
 import ghidra.framework.Application;
 import ghidra.framework.ApplicationConfiguration;
 import ghidra.framework.HeadlessGhidraApplicationConfiguration;
@@ -52,7 +54,7 @@ import java.util.*;
  */
 public class GhidraMCPHeadlessServer implements GhidraLaunchable {
 
-    private static final String VERSION = "5.12.0-headless";
+    private static final String VERSION = "7.0.0-headless";
     private static final int DEFAULT_PORT = 8089;
     private static final String DEFAULT_BIND_ADDRESS = "127.0.0.1";
 
@@ -62,6 +64,7 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
     private int port = DEFAULT_PORT;
     private String bindAddress = DEFAULT_BIND_ADDRESS;
     private boolean running = false;
+    private boolean scriptingBundleHostAcquired = false;
 
     // Endpoint handler registry
     private HeadlessEndpointHandler endpointHandler;
@@ -202,6 +205,91 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
             Application.initializeApplication(layout, config);
             System.out.println("Ghidra initialized in headless mode");
         }
+
+        // Initialize the OSGi/BundleHost subsystem used by GhidraScriptProvider.
+        // In GUI mode this is done by GhidraScriptMgrPlugin; in headless we must do it
+        // explicitly or every /run_ghidra_script and /run_script_inline call throws
+        // NullPointerException at JavaScriptProvider.getScriptInstance() because
+        // GhidraScriptUtil.bundleHost is null.
+        //
+        // Gated on GHIDRA_MCP_ALLOW_SCRIPTS (via SecurityConfig) to avoid the Felix
+        // OSGi framework startup cost (~hundreds of ms) when script execution is
+        // disabled (default since v5.4.1). Held for the lifetime of the server;
+        // released by stop().
+        if (SecurityConfig.getInstance().areScriptsAllowed()) {
+            try {
+                // BundleHost.add() inspects each path: an existing directory yields a
+                // GhidraSourceBundle, anything else (missing path, plain file) yields a
+                // GhidraPlaceholderBundle. A placeholder makes JavaScriptProvider crash
+                // later with `ClassCastException: GhidraPlaceholderBundle cannot be cast
+                // to GhidraSourceBundle`. Ensure the user script dir exists before
+                // acquire so it gets registered as a real source bundle.
+                java.io.File userScriptDir = GhidraScriptUtil.USER_SCRIPTS_DIR != null
+                        ? new java.io.File(GhidraScriptUtil.USER_SCRIPTS_DIR)
+                        : new java.io.File(System.getProperty("user.home"), "ghidra_scripts");
+                boolean scriptDirExisted = userScriptDir.exists();
+                if (!scriptDirExisted) {
+                    userScriptDir.mkdirs();
+                }
+                // acquireBundleHostReference() registers GhidraScriptUtil.USER_SCRIPTS_DIR
+                // itself — not a local override — so a temp-dir fallback would still
+                // leave the canonical (missing) path registered as a
+                // GhidraPlaceholderBundle, which crashes JavaScriptProvider later with a
+                // ClassCastException. If the canonical directory isn't a real, writable
+                // directory after the mkdir attempt we therefore short-circuit: scripts
+                // stay disabled but the server keeps running, instead of acquiring on a
+                // placeholder path.
+                if (!userScriptDir.isDirectory() || !userScriptDir.canWrite()) {
+                    System.err.println(
+                            "User script directory is missing or not writable ("
+                                    + userScriptDir.getAbsolutePath()
+                                    + "); skipping BundleHost init, script execution disabled.");
+                    return;
+                }
+                System.out.println((scriptDirExisted ? "Using" : "Created")
+                        + " user script directory: " + userScriptDir.getAbsolutePath());
+
+                GhidraScriptUtil.acquireBundleHostReference();
+                scriptingBundleHostAcquired = true;
+                System.out.println(
+                        "GhidraScriptUtil BundleHost acquired (script execution enabled)");
+
+                // acquireBundleHostReference() registers script directories but leaves
+                // them DISABLED. JavaScriptProvider.loadClass() then fails with
+                // "Failed to get OSGi bundle containing script" because the Felix
+                // framework refuses to resolve classes from disabled bundles.
+                // HeadlessAnalyzer explicitly calls bundleHost.add(paths, true, true)
+                // — we do the equivalent by enabling the user script dir bundle here.
+                try {
+                    ghidra.app.plugin.core.osgi.BundleHost bh =
+                            GhidraScriptUtil.getBundleHost();
+                    generic.jar.ResourceFile userScriptResource =
+                            new generic.jar.ResourceFile(userScriptDir);
+                    ghidra.app.plugin.core.osgi.GhidraBundle bundle =
+                            bh.getGhidraBundle(userScriptResource);
+                    if (bundle == null) {
+                        bh.add(userScriptResource, true, false);
+                        System.out.println(
+                                "Added user script directory bundle (enabled): "
+                                        + userScriptDir.getAbsolutePath());
+                    } else if (!bundle.isEnabled()) {
+                        bh.enable(bundle);
+                        System.out.println(
+                                "Enabled existing user script directory bundle: "
+                                        + userScriptDir.getAbsolutePath());
+                    }
+                } catch (Throwable t2) {
+                    System.err.println(
+                            "Failed to enable user script bundle: " + t2.getMessage());
+                    t2.printStackTrace();
+                }
+            } catch (Throwable t) {
+                System.err.println(
+                        "Failed to initialize GhidraScriptUtil BundleHost; script execution will fail: "
+                                + t.getMessage());
+                t.printStackTrace();
+            }
+        }
     }
 
     private void loadInitialPrograms(String[] args) {
@@ -322,14 +410,40 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
                         ? JsonHelper.parseBody(exchange.getRequestBody()) : Map.of();
                     sendResponse(exchange, ep.handler().handle(query, body).toJson());
                 } catch (Exception e) {
-                    String msg = e.getMessage() != null ? e.getMessage() : e.toString();
-                    sendResponse(exchange, "{\"error\": \"" + msg.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}");
+                    // Uncaught handler failure: log full detail, return generic
+                    // (avoid leaking paths/class names to the client).
+                    ghidra.util.Msg.error(GhidraMCPHeadlessServer.class,
+                        "Unhandled error on " + ep.path(), e);
+                    sendResponse(exchange,
+                        "{\"error\": \"Internal server error. See the Ghidra application log for details.\"}");
                 }
             });
         }
 
-        // Store scanner size for dynamic endpoint count reporting
-        registeredEndpointCount = scanner.getEndpoints().size();
+        // These routes are registered below via their own safeContext(...) calls
+        // (utility/server/project endpoints that predate the @McpTool convention),
+        // so they are already live and callable. Without this they stayed
+        // invisible in /mcp/schema -- and therefore invisible to the Python
+        // bridge's dynamic tool discovery. Mirrors the GUI-side wiring in
+        // GhidraMCPPlugin; see ManualToolDescriptors for the shared metadata
+        // source. Found via a live-schema-vs-catalog diff (v6.0.0).
+        com.xebyte.core.ManualToolDescriptors.addAll(scanner,
+            "/check_connection", "/configure_analyzer",
+            "/delete_project", "/exit_ghidra", "/get_current_address",
+            "/get_current_function", "/get_version", "/health",
+            "/list_projects", "/mcp/schema",
+            "/server/admin/set_permissions", "/server/admin/terminate_all_checkouts",
+            "/server/admin/terminate_checkout", "/server/admin/users",
+            "/server/checkouts", "/server/connect", "/server/disconnect",
+            "/server/repositories", "/server/repository/create", "/server/repository/file",
+            "/server/repository/files", "/server/version_control/add",
+            "/server/version_control/checkin", "/server/version_control/checkout",
+            "/server/version_control/undo_checkout", "/server/version_history");
+        // Store scanner size for dynamic endpoint count reporting. Now includes
+        // both the dispatch-table (@McpTool-scanned) endpoints and the manually-
+        // registered routes just added to the schema above -- countEndpoints()
+        // no longer needs a hand-maintained "+30" offset for these.
+        registeredEndpointCount = scanner.getDescriptors().size();
 
         // ==========================================================================
         // SCHEMA ENDPOINT — Serves machine-readable API metadata
@@ -354,14 +468,6 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
 
         // --- Program Management --- (registered via HeadlessManagementService)
 
-        // GET_DATA_TYPE_SIZE - Not yet in service layer
-        safeContext("/get_data_type_size", exchange -> {
-            Map<String, String> params = parseQueryParams(exchange);
-            String typeName = params.get("type_name");
-            String programName = params.get("program");
-            sendResponse(exchange, endpointHandler.getDataTypeSize(typeName, programName));
-        });
-
         // --- Project Lifecycle --- (/create_project registered via HeadlessManagementService)
 
         safeContext("/delete_project", exchange -> {
@@ -375,22 +481,15 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
         });
 
         // --- Project Organization ---
-        // Note: /create_folder and /delete_file are NOT registered here because
-        // they are already registered via @McpTool annotations on
-        // ProgramScriptService.{createFolder,deleteFile} which the
-        // AnnotationScanner picks up. Re-registering them manually causes
-        // "cannot add context to list" on headless startup (see #180).
-        // /move_file and /move_folder have no annotation, so they stay manual.
-
-        safeContext("/move_file", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            sendResponse(exchange, endpointHandler.moveFile(params.get("filePath"), params.get("destFolder")));
-        });
-
-        safeContext("/move_folder", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            sendResponse(exchange, endpointHandler.moveFolder(params.get("sourcePath"), params.get("destPath")));
-        });
+        // Note: /create_folder, /delete_file, /move_file and /move_folder are
+        // NOT registered here because they are already registered via @McpTool
+        // annotations on ProgramScriptService.{createFolder,deleteFile,
+        // moveFile,moveFolder} which the AnnotationScanner picks up.
+        // Re-registering them manually causes "cannot add context to list" on
+        // headless startup (see #180). Those shared implementations reach
+        // ProjectData through ProgramProvider.getProject(), which
+        // HeadlessProgramProvider overrides -- that override is what keeps them
+        // working without a PluginTool.
 
         // --- Server Endpoints ---
 
@@ -502,15 +601,6 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
                 params.get("program"), params.get("name"), enabled));
         });
 
-        // --- Batch Variable Types (headless-specific parsing) ---
-
-        safeContext("/batch_set_variable_types", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            boolean forceIndividual = parseBooleanOrDefault(params.get("forceIndividual"), false);
-            sendResponse(exchange, endpointHandler.batchSetVariableTypes(
-                params.get("functionAddress"), params.get("variableTypes"), forceIndividual, params.get("program")));
-        });
-
         // --- Exit ---
 
         safeContext("/exit_ghidra", exchange -> {
@@ -521,11 +611,11 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
     }
 
     private int countEndpoints() {
-        // registeredEndpointCount = annotation-scanned (shared services + HeadlessManagementService)
-        // 30 = infrastructure + schema + remaining manual createContext registrations
-        // (was 31; -2 after #180 dropped /create_folder + /delete_file as duplicates)
-        // (was 29; +1 after adding /server/admin/terminate_all_checkouts for GUI parity)
-        return registeredEndpointCount + 30;
+        // registeredEndpointCount now includes both the annotation-scanned
+        // endpoints and the manually-registered routes added via
+        // ManualToolDescriptors.addAll(...) above -- no more hand-maintained
+        // offset to keep in sync as routes are added or removed.
+        return registeredEndpointCount;
     }
 
     public void stop() {
@@ -546,8 +636,35 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
         }
 
         if (programProvider != null) {
-            System.out.println("Closing programs...");
-            programProvider.closeAllPrograms();
+            try {
+                System.out.println("Closing programs...");
+                programProvider.closeAllPrograms();
+            } finally {
+                // Release the .rep project lock. closeAllPrograms() only
+                // releases Program handles; the project lock acquired by
+                // GhidraProject.openProject() is freed by closeProject().
+                // Without this, even a clean shutdown leaves the project
+                // locked and the next /open_project (or GUI open) fails
+                // with "project is locked". try/finally so a release
+                // failure on one program doesn't skip the lock release.
+                System.out.println("Closing project...");
+                try {
+                    programProvider.closeProject();
+                } catch (Exception e) {
+                    System.err.println("Error closing project: " + e.getMessage());
+                }
+            }
+        }
+
+        if (scriptingBundleHostAcquired) {
+            try {
+                GhidraScriptUtil.releaseBundleHostReference();
+                scriptingBundleHostAcquired = false;
+                System.out.println("GhidraScriptUtil BundleHost released");
+            } catch (Throwable t) {
+                System.err.println(
+                        "Error releasing GhidraScriptUtil BundleHost: " + t.getMessage());
+            }
         }
 
         System.out.println("Server stopped");
@@ -568,6 +685,19 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
         return server.createContext(path, exchange -> {
             if (!isAuthExempt(path)) {
                 com.xebyte.core.SecurityConfig sec = com.xebyte.core.SecurityConfig.getInstance();
+                // Anti-CSRF / DNS-rebinding guard (no-op once a token is set).
+                String crossOriginError = sec.rejectCrossOriginRequest(
+                        exchange.getRequestHeaders().getFirst("Host"),
+                        exchange.getRequestHeaders().getFirst("Origin"));
+                if (crossOriginError != null) {
+                    byte[] body = ("{\"error\": \"" + crossOriginError + "\"}").getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(403, body.length);
+                    try (OutputStream os = exchange.getResponseBody()) {
+                        os.write(body);
+                    }
+                    return;
+                }
                 if (sec.isAuthEnabled()) {
                     String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
                     if (!sec.matchesBearerAuth(authHeader)) {
@@ -599,7 +729,11 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
     private void sendResponse(HttpExchange exchange, String response) throws IOException {
         byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=UTF-8");
-        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        // No Access-Control-Allow-Origin: the bridge is a same-host CLI
+        // client, not a browser. Emitting ACAO:* on a no-auth loopback
+        // server lets any web page the user visits read decompiled code
+        // and drive write endpoints via fetch(). The GUI plugin's TCP
+        // server has never emitted this header; aligning with it.
         exchange.sendResponseHeaders(200, bytes.length);
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(bytes);
@@ -643,6 +777,10 @@ public class GhidraMCPHeadlessServer implements GhidraLaunchable {
             String line;
             while ((line = reader.readLine()) != null) {
                 sb.append(line);
+                // Bound accumulation so a huge body can't exhaust memory.
+                if (sb.length() > com.xebyte.core.SecurityConfig.MAX_REQUEST_BODY_BYTES) {
+                    return params;  // oversized — treat as no params
+                }
             }
             body = sb.toString();
         }

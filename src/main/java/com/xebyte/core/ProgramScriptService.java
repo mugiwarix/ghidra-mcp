@@ -1,22 +1,35 @@
 package com.xebyte.core;
 
 import ghidra.app.services.ProgramManager;
+import ghidra.framework.options.OptionType;
+import ghidra.framework.options.Options;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressIterator;
 import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.address.OverlayAddressSpace;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.util.IntPropertyMap;
+import ghidra.program.model.util.LongPropertyMap;
+import ghidra.program.model.util.ObjectPropertyMap;
+import ghidra.program.model.util.PropertyMap;
+import ghidra.program.model.util.PropertyMapManager;
+import ghidra.program.model.util.StringPropertyMap;
+import ghidra.program.model.util.VoidPropertyMap;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.util.importer.AutoImporter;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.opinion.LoadResults;
 import ghidra.util.Msg;
 import ghidra.util.task.ConsoleTaskMonitor;
+import ghidra.util.task.TimeoutTaskMonitor;
 
 import javax.swing.SwingUtilities;
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -28,13 +41,52 @@ import java.util.concurrent.atomic.AtomicReference;
 @McpToolGroup(value = "program", description = "Program management, script execution, memory read, bookmarks, save")
 public class ProgramScriptService {
 
+    private static final int MAX_SCRIPT_TIMEOUT_SECONDS = 1800;
+
     private final ProgramProvider programProvider;
     private final ThreadingStrategy threadingStrategy;
     private static final String AUTO_ANALYSIS_COMPLETION_MESSAGE = "Auto-analysis completed";
+    private static final Object SCRIPT_BUNDLE_HOST_LOCK = new Object();
+
+    /**
+     * Upper bound on the OSGi build/activate output echoed back in an error
+     * response. Verbose compiler failures can run to many KB of repeated
+     * diagnostics; beyond this we keep only the tail (where the actual error
+     * usually is) and prepend a truncation notice.
+     */
+    private static final int MAX_BUILD_OUTPUT_CHARS = 16 * 1024;
+
+    /**
+     * Return {@code text} unchanged when it fits within {@code maxChars};
+     * otherwise return its last {@code maxChars} characters prefixed with a
+     * notice naming how many characters were dropped.
+     */
+    private static String boundTail(String text, int maxChars) {
+        if (text.length() <= maxChars) {
+            return text;
+        }
+        int dropped = text.length() - maxChars;
+        return "[... truncated " + dropped + " characters; showing last "
+                + maxChars + " ...]\n" + text.substring(dropped);
+    }
 
     public ProgramScriptService(ProgramProvider programProvider, ThreadingStrategy threadingStrategy) {
         this.programProvider = programProvider;
         this.threadingStrategy = threadingStrategy;
+    }
+
+    private static void ensureScriptBundleHostInitialized(File scriptDirectory) {
+        synchronized (SCRIPT_BUNDLE_HOST_LOCK) {
+            if (ghidra.app.script.GhidraScriptUtil.getBundleHost() == null) {
+                // In GUI mode GhidraScriptMgrPlugin owns this lifecycle. The
+                // headless MCP server has no script-manager plugin, but Java
+                // scripts still need the OSGi bundle host before
+                // JavaScriptProvider can compile/load script classes.
+                ghidra.app.script.GhidraScriptUtil.acquireBundleHostReference();
+            }
+            ghidra.app.script.GhidraScriptUtil.getBundleHost()
+                    .enable(new generic.jar.ResourceFile(scriptDirectory));
+        }
     }
 
     /**
@@ -79,7 +131,11 @@ public class ProgramScriptService {
                     mgr.reAnalyzeAll(null);
                 }
                 mgr.startAnalysis(ghidra.util.task.TaskMonitor.DUMMY);
-                mgr.waitForAnalysis(null, ghidra.util.task.TaskMonitor.DUMMY);
+                // Through the guarded helper, never mgr.waitForAnalysis
+                // directly -- see awaitAnyPendingAnalysis. An unguarded call
+                // here is one of the two paths that wedged all three HTTP
+                // threads for 7.8 CPU-hours on 2026-08-11.
+                awaitAnyPendingAnalysis(program);
                 ghidra.program.util.GhidraProgramUtilities.markProgramAnalyzed(program);
                 txOk = true;
             } finally {
@@ -109,7 +165,119 @@ public class ProgramScriptService {
             return;
         }
         program.flushEvents();
-        program.save(reason, ghidra.util.task.TaskMonitor.DUMMY);
+        saveWithRetry(program, () -> program.save(reason, ghidra.util.task.TaskMonitor.DUMMY));
+    }
+
+    @FunctionalInterface
+    private interface ThrowingSave {
+        void run() throws IOException, ghidra.util.exception.CancelledException;
+    }
+
+    /**
+     * Save a program, retrying if the attempt races Ghidra's own
+     * auto-analysis transaction management.
+     *
+     * <p>{@link AutoAnalysisManager} registers its own
+     * {@code DomainObjectListener} on every program and schedules a
+     * background "Auto Analysis" task whenever the program changes (a
+     * rename, a signature edit, a new function) -- entirely independent of
+     * any analysis this class explicitly starts. If that background task's
+     * transaction is still open when a save runs, the save throws
+     * {@code IOException: Unable to lock due to active transaction}.
+     * Confirmed via Ghidra's own application.log: the same stack trace,
+     * through {@code saveCurrentProgram}, recurring since at least
+     * 2026-07-08 -- weeks before any code path here explicitly triggered
+     * analysis, so it is not specific to this class's own analysis calls.</p>
+     *
+     * <p>Waiting for {@link AutoAnalysisManager#waitForAnalysis} to return
+     * first narrows the window but does not close it: Ghidra logs the task
+     * as complete and this save's lock failure in the same instant, meaning
+     * the completion notification and the background task's own transaction
+     * teardown are not perfectly synchronized with each other. A short
+     * backoff-and-retry on that specific message is the pragmatic fix for a
+     * race that waiting alone cannot fully eliminate.</p>
+     */
+    private void saveWithRetry(Program program, ThrowingSave saveAction)
+            throws IOException, ghidra.util.exception.CancelledException {
+        final int maxAttempts = 4;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            awaitAnyPendingAnalysis(program);
+            try {
+                saveAction.run();
+                return;
+            } catch (IOException e) {
+                String msg = e.getMessage();
+                boolean isLockRace = msg != null && msg.contains("Unable to lock due to active transaction");
+                if (!isLockRace || attempt == maxAttempts) {
+                    throw e;
+                }
+                Msg.warn(this, "Save raced Ghidra's own auto-analysis transaction (attempt "
+                        + attempt + "/" + maxAttempts + "), retrying: " + msg);
+                try {
+                    Thread.sleep(150L * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+    }
+
+    /**
+     * Re-entrancy guard for {@link AutoAnalysisManager#waitForAnalysis}.
+     *
+     * <p>{@code waitForAnalysis(null, monitor)} can re-enter ITSELF. Measured
+     * from a live thread dump on 2026-08-11, after Ghidra had been
+     * unresponsive for hours:</p>
+     *
+     * <pre>
+     *   AutoAnalysisManager.scheduleWorker(1350)
+     *     -&gt; waitForAnalysis(518)
+     *       -&gt; analysisWorkerCallback(523)
+     *         -&gt; AnalysisWorkerCommand.applyTo(1694)
+     *           -&gt; applyToWithTransaction
+     *             -&gt; scheduleWorker(1350)   ... and round again
+     * </pre>
+     *
+     * <p>All THREE GhidraMCP-HTTP threads -- the entire pool -- were stuck in
+     * that loop, 317 frames deep, having burned ~9,400 CPU-seconds EACH
+     * (7.8 CPU-hours between them). They never return, so the pool is
+     * permanently consumed and every one of the 253 endpoints times out. The
+     * symptom presents as "Ghidra is slow", not as an error, and the only
+     * recovery is a restart.</p>
+     *
+     * <p>A thread that is already inside a wait does not need to start
+     * another one: the outer call is still going to wait for the same
+     * analysis to finish. So a nested call on the same thread returns
+     * immediately and the recursion cannot form. This is deliberately the
+     * smallest fix that provably terminates -- it changes no semantics for
+     * the outer wait, and if it is wrong the failure mode is a save racing
+     * analysis, which {@code saveWithRetry} already handles and which is
+     * vastly preferable to a wedged server.</p>
+     */
+    // Package-visible on purpose: FrontEndProgramProvider shares this ONE
+    // guard. Two separate ThreadLocals would not guard each other, and the
+    // recursion can cross both classes on a single thread.
+    static final ThreadLocal<Boolean> IN_ANALYSIS_WAIT =
+            ThreadLocal.withInitial(() -> Boolean.FALSE);
+
+    private void awaitAnyPendingAnalysis(Program program) {
+        if (Boolean.TRUE.equals(IN_ANALYSIS_WAIT.get())) {
+            // Already waiting further up this same thread's stack. Starting
+            // another wait here is what forms the infinite recursion above.
+            return;
+        }
+        IN_ANALYSIS_WAIT.set(Boolean.TRUE);
+        try {
+            AutoAnalysisManager.getAnalysisManager(program)
+                    .waitForAnalysis(null, ghidra.util.task.TaskMonitor.DUMMY);
+        } catch (Exception e) {
+            // Best-effort: let the save call itself surface any real failure
+            // rather than mask it with a wait-side error here.
+            Msg.warn(this, "awaitAnyPendingAnalysis failed, proceeding to save anyway: " + e.getMessage());
+        } finally {
+            IN_ANALYSIS_WAIT.set(Boolean.FALSE);
+        }
     }
 
     // ========================================================================
@@ -131,35 +299,691 @@ public class ProgramScriptService {
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
 
-        StringBuilder metadata = new StringBuilder();
-        metadata.append("Program Name: ").append(program.getName()).append("\n");
-        metadata.append("Executable Path: ").append(program.getExecutablePath()).append("\n");
-        metadata.append("Architecture: ").append(program.getLanguage().getProcessor().toString()).append("\n");
-        metadata.append("Compiler: ").append(program.getCompilerSpec().getCompilerSpecID()).append("\n");
-        metadata.append("Language: ").append(program.getLanguage().getLanguageID()).append("\n");
-        metadata.append("Endian: ").append(program.getLanguage().isBigEndian() ? "Big" : "Little").append("\n");
-        metadata.append("Address Size: ").append(program.getAddressFactory().getDefaultAddressSpace().getSize()).append(" bits\n");
-        metadata.append("Base Address: ").append(program.getImageBase()).append("\n");
-
-        // Memory information
         long totalSize = 0;
         int blockCount = 0;
         for (MemoryBlock block : program.getMemory().getBlocks()) {
             totalSize += block.getSize();
             blockCount++;
         }
-        metadata.append("Memory Blocks: ").append(blockCount).append("\n");
-        metadata.append("Total Memory Size: ").append(totalSize).append(" bytes\n");
 
-        // Function count
-        int functionCount = program.getFunctionManager().getFunctionCount();
-        metadata.append("Function Count: ").append(functionCount).append("\n");
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("program_name", program.getName());
+        out.put("executable_path", program.getExecutablePath());
+        out.put("architecture", program.getLanguage().getProcessor().toString());
+        out.put("compiler", program.getCompilerSpec().getCompilerSpecID().toString());
+        out.put("language", program.getLanguage().getLanguageID().toString());
+        out.put("endian", program.getLanguage().isBigEndian() ? "big" : "little");
+        out.put("address_size_bits", program.getAddressFactory().getDefaultAddressSpace().getSize());
+        out.put("base_address", program.getImageBase().toString(false));
+        out.put("memory_blocks", blockCount);
+        out.put("total_memory_size", totalSize);
+        out.put("function_count", program.getFunctionManager().getFunctionCount());
+        out.put("symbol_count", program.getSymbolTable().getNumSymbols());
+        return Response.ok(out);
+    }
 
-        // Symbol count
-        int symbolCount = program.getSymbolTable().getNumSymbols();
-        metadata.append("Symbol Count: ").append(symbolCount).append("\n");
+    // ========================================================================
+    // Program Options (typed key -> value settings grouped by category)
+    // ========================================================================
 
-        return Response.text(metadata.toString());
+    /** Standard address-parameter description shared by property-map tools. */
+    private static final String ADDRESS_PARAM_DESC =
+            "Address in the program. Accepts 0x<hex> (default space) or <space>:<hex> "
+          + "(e.g., mem:1000, code:ff00). Note: some programs — particularly "
+          + "embedded/microcontroller targets — are not address-space-agnostic; "
+          + "use get_address_spaces to discover spaces before assuming a plain hex "
+          + "address is unambiguous.";
+
+    /**
+     * List every program option group (e.g. "Program Information", "Analyzers",
+     * "Decompiler", "Disassembler"). Each group is a namespace of typed key→value
+     * settings; use {@code get_program_options} to read a group's entries.
+     */
+    @McpTool(path = "/list_option_groups",
+             description = "List program option groups (e.g. 'Program Information', 'Analyzers', 'Decompiler'). Each group holds typed key→value settings; use get_program_options to read a group's entries.",
+             category = "program")
+    public Response listOptionGroups(
+            @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            List<Map<String, Object>> groups = new ArrayList<>();
+            for (String groupName : program.getOptionsNames()) {
+                Options opts = program.getOptions(groupName);
+                groups.add(JsonHelper.mapOf(
+                    "name", groupName,
+                    "option_count", opts.getOptionNames().size()));
+            }
+            return Response.ok(JsonHelper.mapOf(
+                "groups", groups,
+                "count", groups.size(),
+                "program", program.getName()));
+        } catch (Exception e) {
+            return Response.err(e.getMessage());
+        }
+    }
+
+    /**
+     * Read every option in a single group with its type, current value, default,
+     * and description. Values are rendered as strings via
+     * {@link Options#getValueAsString(String)} so every option type is legible.
+     */
+    @McpTool(path = "/get_program_options",
+             description = "Read all options in a program option group with types, current values, defaults, and descriptions. Use list_option_groups to discover group names.",
+             category = "program")
+    public Response getProgramOptions(
+            @Param(value = "group", description = "Option group name from list_option_groups (e.g. 'Program Information', 'Analyzers').") String group,
+            @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (group == null || group.isEmpty()) {
+            return Response.err("group is required (use list_option_groups to discover group names)");
+        }
+        if (!program.getOptionsNames().contains(group)) {
+            return Response.err("No such option group: '" + group + "'. Use list_option_groups to see available groups.");
+        }
+
+        try {
+            Options opts = program.getOptions(group);
+            List<Map<String, Object>> options = new ArrayList<>();
+            for (String name : opts.getOptionNames()) {
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("name", name);
+                OptionType type = opts.getType(name);
+                entry.put("type", type != null ? type.name() : "NO_TYPE");
+                // getValueAsString returns null for CUSTOM_TYPE options (e.g.
+                // "Analysis Times.Times"), and the JSON writer drops null-valued
+                // keys -- so the entry silently lost `value` entirely for that
+                // one type while every other entry carried it. A key the shape
+                // promises must always be present, so fall back to the stored
+                // object's own rendering before giving up on an empty string.
+                entry.put("value", optionValueString(opts, name, false));
+                entry.put("default_value", optionValueString(opts, name, true));
+                entry.put("is_default", opts.isDefaultValue(name));
+                entry.put("registered", opts.isRegistered(name));
+                String desc = opts.getDescription(name);
+                if (desc != null && !desc.isEmpty()) {
+                    entry.put("description", desc);
+                }
+                options.add(entry);
+            }
+            return Response.ok(JsonHelper.mapOf(
+                "group", group,
+                "options", options,
+                "count", options.size(),
+                "program", program.getName()));
+        } catch (Exception e) {
+            return Response.err(e.getMessage());
+        }
+    }
+
+    /**
+     * Render an option's value (or default) as a string that is never null.
+     *
+     * <p>{@link Options#getValueAsString} and {@link Options#getDefaultValueAsString}
+     * both return null for option types they cannot stringify -- CUSTOM_TYPE in
+     * practice. Because the JSON writer omits null-valued keys, that turned into
+     * an entry missing {@code value} altogether while its siblings had one, so a
+     * caller iterating options had to special-case a key the shape promises.
+     * Falling back to the stored object's own {@code toString} keeps the key
+     * present and usually carries real information; empty string is the last
+     * resort, meaning "present but not representable".
+     */
+    private static String optionValueString(Options opts, String name, boolean wantDefault) {
+        String value = wantDefault ? opts.getDefaultValueAsString(name) : opts.getValueAsString(name);
+        if (value != null) {
+            return value;
+        }
+        try {
+            Object raw = wantDefault ? opts.getDefaultValue(name) : opts.getObject(name, null);
+            if (raw != null) {
+                return String.valueOf(raw);
+            }
+        } catch (Exception ignored) {
+            // A custom option whose accessor throws is still an option we must
+            // list; degrade to empty rather than failing the whole group.
+        }
+        return "";
+    }
+
+    /**
+     * Set (or create) a typed option in a group. When the option already exists
+     * its current type is reused; otherwise the caller supplies {@code type}.
+     * Supported types: string, int, long, double, float, boolean. The value is
+     * parsed BEFORE the write transaction so parse errors surface cleanly.
+     * Persists to the database on the next {@code save_program}.
+     */
+    @McpTool(path = "/set_program_option", method = "POST",
+             description = "Set a typed program option. If the option already exists its type is reused; otherwise pass type (string|int|long|double|float|boolean). New/custom options are created on demand. Call save_program to persist.",
+             category = "program")
+    public Response setProgramOption(
+            @Param(value = "group", source = ParamSource.BODY, description = "Option group name (e.g. 'Program Information'). Use list_option_groups to discover names.") String group,
+            @Param(value = "name", source = ParamSource.BODY, description = "Option name within the group.") String name,
+            @Param(value = "value", source = ParamSource.BODY, description = "New value as a string; parsed according to the option type.") String value,
+            @Param(value = "type", source = ParamSource.BODY, defaultValue = "",
+                   description = "Value type: string|int|long|double|float|boolean. Optional when the option already exists (its current type is reused); defaults to string for a brand-new option.") String type,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (group == null || group.isEmpty()) return Response.err("group is required");
+        if (name == null || name.isEmpty()) return Response.err("name is required");
+        if (value == null) return Response.err("value is required");
+        if (!program.getOptionsNames().contains(group)) {
+            return Response.err("No such option group: '" + group + "'. Use list_option_groups to see available groups.");
+        }
+
+        Options opts = program.getOptions(group);
+
+        // Resolve the value type: explicit arg wins; otherwise infer from an
+        // existing option; otherwise default to string.
+        String resolved = (type == null) ? "" : type.trim().toLowerCase();
+        if (resolved.isEmpty()) {
+            if (opts.contains(name)) {
+                resolved = optionTypeKeyword(opts.getType(name));
+                if (resolved == null) {
+                    return Response.err("Option '" + name + "' has type "
+                        + opts.getType(name) + " which cannot be set via this tool. "
+                        + "Settable types: string, int, long, double, float, boolean.");
+                }
+            } else {
+                resolved = "string";
+            }
+        }
+
+        // Parse the value outside the transaction so a bad number is a clean error.
+        final Object parsed;
+        try {
+            switch (resolved) {
+                case "string":  parsed = value; break;
+                case "int":     parsed = Integer.parseInt(value.trim()); break;
+                case "long":    parsed = Long.parseLong(value.trim()); break;
+                case "double":  parsed = Double.parseDouble(value.trim()); break;
+                case "float":   parsed = Float.parseFloat(value.trim()); break;
+                case "boolean": parsed = Boolean.parseBoolean(value.trim()); break;
+                default:
+                    return Response.err("Unsupported type '" + resolved
+                        + "'. Use one of: string, int, long, double, float, boolean.");
+            }
+        } catch (NumberFormatException nfe) {
+            return Response.err("Value '" + value + "' is not a valid " + resolved + ": " + nfe.getMessage());
+        }
+
+        final String finalType = resolved;
+        try {
+            threadingStrategy.executeWrite(program, "Set Program Option", () -> {
+                switch (finalType) {
+                    case "string":  opts.setString(name, (String) parsed); break;
+                    case "int":     opts.setInt(name, (Integer) parsed); break;
+                    case "long":    opts.setLong(name, (Long) parsed); break;
+                    case "double":  opts.setDouble(name, (Double) parsed); break;
+                    case "float":   opts.setFloat(name, (Float) parsed); break;
+                    case "boolean": opts.setBoolean(name, (Boolean) parsed); break;
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Failed to set option: " + e.getMessage());
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+            "success", true,
+            "group", group,
+            "name", name,
+            "type", finalType,
+            "value", opts.getValueAsString(name),
+            "note", "Call save_program to persist this change to the database.",
+            "program", program.getName()));
+    }
+
+    /**
+     * Remove an option from a group. Built-in registered options may be
+     * re-created with default values by Ghidra; this is mainly for clearing
+     * custom options previously written via {@code set_program_option}.
+     */
+    @McpTool(path = "/remove_program_option", method = "POST",
+             description = "Remove an option from a program option group. Built-in registered options may be re-created with defaults by Ghidra; primarily for clearing custom options. Call save_program to persist.",
+             category = "program")
+    public Response removeProgramOption(
+            @Param(value = "group", source = ParamSource.BODY, description = "Option group name.") String group,
+            @Param(value = "name", source = ParamSource.BODY, description = "Option name to remove.") String name,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (group == null || group.isEmpty()) return Response.err("group is required");
+        if (name == null || name.isEmpty()) return Response.err("name is required");
+        if (!program.getOptionsNames().contains(group)) {
+            return Response.err("No such option group: '" + group + "'. Use list_option_groups to see available groups.");
+        }
+
+        Options opts = program.getOptions(group);
+        if (!opts.contains(name)) {
+            return Response.ok(JsonHelper.mapOf(
+                "success", false,
+                "message", "No option named '" + name + "' in group '" + group + "'",
+                "program", program.getName()));
+        }
+
+        try {
+            threadingStrategy.executeWrite(program, "Remove Program Option", () -> {
+                opts.removeOption(name);
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Failed to remove option: " + e.getMessage());
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+            "success", true,
+            "group", group,
+            "name", name,
+            "note", "Call save_program to persist this change to the database.",
+            "program", program.getName()));
+    }
+
+    // ========================================================================
+    // Property Maps (typed per-address key -> value stores)
+    // ========================================================================
+
+    /**
+     * List all user-defined property maps. Each map has a name, a value type
+     * (int / long / string / object / void), and the count of addresses that
+     * currently hold a value.
+     */
+    @McpTool(path = "/list_property_maps",
+             description = "List user-defined property maps — typed per-address key→value stores. Each map reports its name, value type (int|long|string|object|void), and the number of addresses holding a value.",
+             category = "program")
+    public Response listPropertyMaps(
+            @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        try {
+            PropertyMapManager mgr = program.getUsrPropertyManager();
+            List<Map<String, Object>> maps = new ArrayList<>();
+            Iterator<String> it = mgr.propertyManagers();
+            while (it.hasNext()) {
+                String mapName = it.next();
+                PropertyMap<?> map = mgr.getPropertyMap(mapName);
+                maps.add(JsonHelper.mapOf(
+                    "name", mapName,
+                    "value_type", propertyMapValueType(map),
+                    "size", map != null ? map.getSize() : 0));
+            }
+            return Response.ok(JsonHelper.mapOf(
+                "property_maps", maps,
+                "count", maps.size(),
+                "program", program.getName()));
+        } catch (Exception e) {
+            return Response.err(e.getMessage());
+        }
+    }
+
+    /**
+     * Create a new user property map. Types: int, long, string, void
+     * (address-presence tag). Store arbitrary structured per-address data by
+     * using a string map holding JSON.
+     */
+    @McpTool(path = "/create_property_map", method = "POST",
+             description = "Create a user property map to store typed values keyed by address. Types: int, long, string, void (address-presence tag). Use a string map holding JSON to store arbitrary structured per-address data. Call save_program to persist.",
+             category = "program")
+    public Response createPropertyMap(
+            @Param(value = "name", source = ParamSource.BODY, description = "Unique map name.") String name,
+            @Param(value = "type", source = ParamSource.BODY, defaultValue = "string",
+                   description = "Value type: int, long, string, or void.") String type,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (name == null || name.isEmpty()) return Response.err("name is required");
+        final String kind = (type == null || type.isEmpty()) ? "string" : type.trim().toLowerCase();
+        if (!Set.of("int", "long", "string", "void").contains(kind)) {
+            return Response.err("Unsupported map type '" + kind + "'. Use one of: int, long, string, void.");
+        }
+
+        PropertyMapManager mgr = program.getUsrPropertyManager();
+        if (mgr.getPropertyMap(name) != null) {
+            return Response.err("Property map '" + name + "' already exists.");
+        }
+
+        try {
+            threadingStrategy.executeWrite(program, "Create Property Map", () -> {
+                switch (kind) {
+                    case "int":    mgr.createIntPropertyMap(name); break;
+                    case "long":   mgr.createLongPropertyMap(name); break;
+                    case "string": mgr.createStringPropertyMap(name); break;
+                    case "void":   mgr.createVoidPropertyMap(name); break;
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Failed to create property map: " + e.getMessage());
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+            "success", true,
+            "name", name,
+            "value_type", kind,
+            "note", "Call save_program to persist this change to the database.",
+            "program", program.getName()));
+    }
+
+    /**
+     * Delete an entire user property map and all its values.
+     */
+    @McpTool(path = "/delete_property_map", method = "POST",
+             description = "Delete a user property map and all values it holds. Call save_program to persist.",
+             category = "program")
+    public Response deletePropertyMap(
+            @Param(value = "name", source = ParamSource.BODY, description = "Map name to delete.") String name,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (name == null || name.isEmpty()) return Response.err("name is required");
+        PropertyMapManager mgr = program.getUsrPropertyManager();
+        if (mgr.getPropertyMap(name) == null) {
+            return Response.ok(JsonHelper.mapOf(
+                "success", false,
+                "message", "No property map named '" + name + "'",
+                "program", program.getName()));
+        }
+
+        final AtomicBoolean removed = new AtomicBoolean(false);
+        try {
+            threadingStrategy.executeWrite(program, "Delete Property Map", () -> {
+                removed.set(mgr.removePropertyMap(name));
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Failed to delete property map: " + e.getMessage());
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+            "success", removed.get(),
+            "name", name,
+            "note", "Call save_program to persist this change to the database.",
+            "program", program.getName()));
+    }
+
+    /**
+     * Set a value at an address in a property map. The value is coerced to the
+     * map's declared type. {@code void} maps ignore the value and simply tag the
+     * address. Object maps cannot be written here (they require a registered
+     * {@link ghidra.util.Saveable} type). The map must already exist.
+     */
+    @McpTool(path = "/set_property", method = "POST",
+             description = "Set a value at an address in a property map. The value is coerced to the map's type (int/long/string); 'void' maps ignore the value and just tag the address. Create the map first with create_property_map. Call save_program to persist.",
+             category = "program")
+    public Response setProperty(
+            @Param(value = "map", source = ParamSource.BODY, description = "Property map name (from list_property_maps).") String mapName,
+            @Param(value = "address", paramType = "address", source = ParamSource.BODY, description = ADDRESS_PARAM_DESC) String addressStr,
+            @Param(value = "value", source = ParamSource.BODY, defaultValue = "",
+                   description = "Value to store, as a string; parsed per the map's type. Ignored for 'void' maps.") String value,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (mapName == null || mapName.isEmpty()) return Response.err("map is required");
+        if (addressStr == null || addressStr.isEmpty()) return Response.err("address is required");
+
+        PropertyMap<?> map = program.getUsrPropertyManager().getPropertyMap(mapName);
+        if (map == null) {
+            return Response.err("No property map named '" + mapName + "'. Create it with create_property_map.");
+        }
+        Address address = ServiceUtils.parseAddress(program, addressStr);
+        if (address == null) {
+            return Response.err(ServiceUtils.getLastParseError());
+        }
+
+        if (map instanceof ObjectPropertyMap) {
+            return Response.err("Object property maps cannot be written via MCP (they require a registered Saveable type).");
+        }
+
+        // Parse numeric values outside the transaction for clean error reporting.
+        final Object parsed;
+        try {
+            if (map instanceof IntPropertyMap) {
+                if (value == null || value.isEmpty()) return Response.err("value is required for an int property map");
+                parsed = Integer.parseInt(value.trim());
+            } else if (map instanceof LongPropertyMap) {
+                if (value == null || value.isEmpty()) return Response.err("value is required for a long property map");
+                parsed = Long.parseLong(value.trim());
+            } else if (map instanceof StringPropertyMap) {
+                if (value == null) return Response.err("value is required for a string property map");
+                parsed = value;
+            } else {
+                parsed = null; // void map — presence only
+            }
+        } catch (NumberFormatException nfe) {
+            return Response.err("Value '" + value + "' is not valid for map '" + mapName + "': " + nfe.getMessage());
+        }
+
+        try {
+            threadingStrategy.executeWrite(program, "Set Property", () -> {
+                if (map instanceof IntPropertyMap ip) {
+                    ip.add(address, (Integer) parsed);
+                } else if (map instanceof LongPropertyMap lp) {
+                    lp.add(address, (Long) parsed);
+                } else if (map instanceof StringPropertyMap sp) {
+                    sp.add(address, (String) parsed);
+                } else if (map instanceof VoidPropertyMap vp) {
+                    vp.add(address);
+                }
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Failed to set property: " + e.getMessage());
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+            "success", true,
+            "map", mapName,
+            "address", address.toString(),
+            "value_type", propertyMapValueType(map),
+            "value", parsed,
+            "note", "Call save_program to persist this change to the database.",
+            "program", program.getName()));
+    }
+
+    /**
+     * Read the value stored at an address in a property map. Returns
+     * {@code has_value=false} with a null value when the address holds no
+     * property. Object-map values are rendered via {@code toString()}.
+     */
+    @McpTool(path = "/get_property",
+             description = "Read the value stored at an address in a property map. Returns has_value=false and a null value when the address holds no property.",
+             category = "program")
+    public Response getProperty(
+            @Param(value = "map", description = "Property map name (from list_property_maps).") String mapName,
+            @Param(value = "address", paramType = "address", description = ADDRESS_PARAM_DESC) String addressStr,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (mapName == null || mapName.isEmpty()) return Response.err("map is required");
+        if (addressStr == null || addressStr.isEmpty()) return Response.err("address is required");
+
+        PropertyMap<?> map = program.getUsrPropertyManager().getPropertyMap(mapName);
+        if (map == null) {
+            return Response.err("No property map named '" + mapName + "'.");
+        }
+        Address address = ServiceUtils.parseAddress(program, addressStr);
+        if (address == null) {
+            return Response.err(ServiceUtils.getLastParseError());
+        }
+
+        try {
+            boolean hasValue = map.hasProperty(address);
+            Object value = hasValue ? renderPropertyValue(map.get(address)) : null;
+            return Response.ok(JsonHelper.mapOf(
+                "map", mapName,
+                "address", address.toString(),
+                "has_value", hasValue,
+                "value_type", propertyMapValueType(map),
+                "value", value,
+                "program", program.getName()));
+        } catch (Exception e) {
+            return Response.err(e.getMessage());
+        }
+    }
+
+    /**
+     * Remove the value stored at a single address in a property map.
+     */
+    @McpTool(path = "/remove_property", method = "POST",
+             description = "Remove the value stored at a single address in a property map. Call save_program to persist.",
+             category = "program")
+    public Response removeProperty(
+            @Param(value = "map", source = ParamSource.BODY, description = "Property map name.") String mapName,
+            @Param(value = "address", paramType = "address", source = ParamSource.BODY, description = ADDRESS_PARAM_DESC) String addressStr,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (mapName == null || mapName.isEmpty()) return Response.err("map is required");
+        if (addressStr == null || addressStr.isEmpty()) return Response.err("address is required");
+
+        PropertyMap<?> map = program.getUsrPropertyManager().getPropertyMap(mapName);
+        if (map == null) {
+            return Response.err("No property map named '" + mapName + "'.");
+        }
+        Address address = ServiceUtils.parseAddress(program, addressStr);
+        if (address == null) {
+            return Response.err(ServiceUtils.getLastParseError());
+        }
+
+        final AtomicBoolean removed = new AtomicBoolean(false);
+        try {
+            threadingStrategy.executeWrite(program, "Remove Property", () -> {
+                removed.set(map.remove(address));
+                return null;
+            });
+        } catch (Exception e) {
+            return Response.err("Failed to remove property: " + e.getMessage());
+        }
+
+        return Response.ok(JsonHelper.mapOf(
+            "success", removed.get(),
+            "map", mapName,
+            "address", address.toString(),
+            "note", "Call save_program to persist this change to the database.",
+            "program", program.getName()));
+    }
+
+    /**
+     * List (address, value) entries stored in a property map with pagination.
+     * Optionally restrict to an inclusive address range via {@code start}/{@code end}.
+     */
+    @McpTool(path = "/list_properties",
+             description = "List (address, value) entries stored in a property map, with pagination. Optionally restrict to an inclusive address range with start/end.",
+             category = "program")
+    public Response listProperties(
+            @Param(value = "map", description = "Property map name (from list_property_maps).") String mapName,
+            @Param(value = "start", paramType = "address", defaultValue = "", description = "Optional inclusive start address of a range filter.") String startStr,
+            @Param(value = "end", paramType = "address", defaultValue = "", description = "Optional inclusive end address of a range filter (requires start).") String endStr,
+            @Param(value = "offset", defaultValue = "0", description = "Number of entries to skip.") int offset,
+            @Param(value = "limit", defaultValue = "100", description = "Maximum number of entries to return.") int limit,
+            @Param(value = "program", defaultValue = "") String programName) {
+        ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
+        if (pe.hasError()) return pe.error();
+        Program program = pe.program();
+
+        if (mapName == null || mapName.isEmpty()) return Response.err("map is required");
+        PropertyMap<?> map = program.getUsrPropertyManager().getPropertyMap(mapName);
+        if (map == null) {
+            return Response.err("No property map named '" + mapName + "'.");
+        }
+        if (offset < 0) offset = 0;
+        if (limit <= 0) limit = 100;
+
+        try {
+            AddressIterator it;
+            boolean hasStart = startStr != null && !startStr.isEmpty();
+            boolean hasEnd = endStr != null && !endStr.isEmpty();
+            if (hasStart != hasEnd) {
+                return Response.err("Provide both start and end to filter by range, or neither.");
+            }
+            if (hasStart) {
+                Address start = ServiceUtils.parseAddress(program, startStr);
+                if (start == null) return Response.err("start: " + ServiceUtils.getLastParseError());
+                Address end = ServiceUtils.parseAddress(program, endStr);
+                if (end == null) return Response.err("end: " + ServiceUtils.getLastParseError());
+                it = map.getPropertyIterator(start, end);
+            } else {
+                it = map.getPropertyIterator();
+            }
+
+            List<Map<String, Object>> entries = new ArrayList<>();
+            int skipped = 0;
+            while (it.hasNext()) {
+                Address addr = it.next();
+                if (skipped < offset) {
+                    skipped++;
+                    continue;
+                }
+                if (entries.size() >= limit) break;
+                entries.add(JsonHelper.mapOf(
+                    "address", addr.toString(),
+                    "value", renderPropertyValue(map.get(addr))));
+            }
+            return Response.ok(JsonHelper.mapOf(
+                "map", mapName,
+                "value_type", propertyMapValueType(map),
+                "entries", entries,
+                "count", entries.size(),
+                "total", map.getSize(),
+                "offset", offset,
+                "limit", limit,
+                "program", program.getName()));
+        } catch (Exception e) {
+            return Response.err(e.getMessage());
+        }
+    }
+
+    /** Map an {@link OptionType} to the keyword accepted by set_program_option, or null if unsettable. */
+    private static String optionTypeKeyword(OptionType type) {
+        if (type == null) return null;
+        switch (type) {
+            case STRING_TYPE:  return "string";
+            case INT_TYPE:     return "int";
+            case LONG_TYPE:    return "long";
+            case DOUBLE_TYPE:  return "double";
+            case FLOAT_TYPE:   return "float";
+            case BOOLEAN_TYPE: return "boolean";
+            default:           return null;
+        }
+    }
+
+    /** Classify a property map by its concrete value type. */
+    private static String propertyMapValueType(PropertyMap<?> map) {
+        if (map instanceof IntPropertyMap)    return "int";
+        if (map instanceof LongPropertyMap)   return "long";
+        if (map instanceof StringPropertyMap) return "string";
+        if (map instanceof VoidPropertyMap)   return "void";
+        if (map instanceof ObjectPropertyMap) return "object";
+        return "unknown";
+    }
+
+    /** Render a stored property value for JSON: Saveable objects become their toString(). */
+    private static Object renderPropertyValue(Object raw) {
+        if (raw instanceof ghidra.util.Saveable) {
+            return raw.toString();
+        }
+        return raw;
     }
 
     // ========================================================================
@@ -191,7 +1015,7 @@ public class ProgramScriptService {
                         errorMsg.set("Program has no domain file");
                         return;
                     }
-                    df.save(new ConsoleTaskMonitor());
+                    saveWithRetry(program, () -> df.save(new ConsoleTaskMonitor()));
                     resultData.set(JsonHelper.mapOf(
                         "success", true,
                         "program", program.getName(),
@@ -227,6 +1051,7 @@ public class ProgramScriptService {
             return Response.ok(JsonHelper.mapOf(
                 "success", true,
                 "saved_count", 0,
+                "open_program_count", 0,
                 "programs", List.of(),
                 "errors", List.of(),
                 "message", "No open programs to save"
@@ -253,7 +1078,20 @@ public class ProgramScriptService {
                         continue;
                     }
                     info.put("path", df.getPathname());
-                    df.save(new ConsoleTaskMonitor());
+                    // A DomainFile that is not in a writable project is a proxy
+                    // (no on-disk location) \u2014 calling save() on it throws the
+                    // cryptic "Location does not exist for a save operation!".
+                    // Surface a specific message so callers know to re-load
+                    // with an active project open.
+                    if (!df.isInWritableProject()) {
+                        info.put("error",
+                            "Program is not attached to a writable project "
+                            + "(transient DomainFileProxy); re-load it with a "
+                            + "project open before saving.");
+                        errors.get().add(info);
+                        continue;
+                    }
+                    saveWithRetry(program, () -> df.save(new ConsoleTaskMonitor()));
                     saved.get().add(info);
                 } catch (Throwable e) {
                     info.put("error", e.getMessage() != null ? e.getMessage() : e.toString());
@@ -277,6 +1115,7 @@ public class ProgramScriptService {
         return Response.ok(JsonHelper.mapOf(
             "success", errors.get().isEmpty(),
             "saved_count", saved.get().size(),
+            "open_program_count", programs.length,
             "programs", saved.get(),
             "errors", errors.get()
         ));
@@ -297,6 +1136,7 @@ public class ProgramScriptService {
         List<Map<String, Object>> programList = new ArrayList<>();
         for (Program prog : programs) {
             int physicalSpaceCount = ServiceUtils.getPhysicalSpaceCount(prog);
+            int overlaySpaceCount  = ServiceUtils.getOverlaySpaceCount(prog);
             programList.add(JsonHelper.mapOf(
                 "name", prog.getName(),
                 "path", prog.getDomainFile().getPathname(),
@@ -307,7 +1147,12 @@ public class ProgramScriptService {
                 "image_base", prog.getImageBase().toString(),
                 "memory_size", prog.getMemory().getSize(),
                 "function_count", prog.getFunctionManager().getFunctionCount(),
-                "has_multiple_address_spaces", physicalSpaceCount > 1
+                // Physical-space ambiguity (true on 8051/AVR with separate
+                // CODE/RAM spaces). Overlays do NOT make plain hex ambiguous,
+                // so this stays false on single-RAM programs with overlays.
+                "has_multiple_address_spaces", physicalSpaceCount > 1,
+                "has_overlay_spaces",          overlaySpaceCount > 0,
+                "overlay_space_count",         overlaySpaceCount
             ));
         }
 
@@ -319,10 +1164,16 @@ public class ProgramScriptService {
     }
 
     @McpTool(path = "/close_program", method = "POST",
-             description = "Close an open program by project path or name", category = "program")
+             description = "Close an open program by project path or name. Never prompts interactively: "
+                         + "unsaved changes are saved first by default (save=true) or silently discarded "
+                         + "(save=false) before closing, so this cannot block the caller on a GUI "
+                         + "confirmation dialog the way Ghidra's own close normally would.", category = "program")
     public Response closeProgram(
             @Param(value = "name", source = ParamSource.BODY,
-                    description = "Program name or project path") String name) {
+                    description = "Program name or project path") String name,
+            @Param(value = "save", source = ParamSource.BODY, defaultValue = "true",
+                    description = "Save unsaved changes before closing (default true). false discards them. "
+                                + "Either way the close proceeds without prompting.") boolean save) {
         if (name == null || name.trim().isEmpty()) {
             return Response.err("Program name or path is required");
         }
@@ -336,10 +1187,26 @@ public class ProgramScriptService {
                 try {
                     for (ProgramManager pm : findAllProgramManagers()) {
                         for (Program program : pm.getAllOpenPrograms()) {
-                            if (programMatches(program, search)) {
-                                pm.closeProgram(program, false);
-                                closedCount.incrementAndGet();
+                            if (!programMatches(program, search)) {
+                                continue;
                             }
+                            if (save && program.isChanged()) {
+                                ghidra.framework.model.DomainFile df = program.getDomainFile();
+                                if (df != null && df.isInWritableProject()) {
+                                    saveWithRetry(program, () -> df.save(new ConsoleTaskMonitor()));
+                                }
+                            }
+                            // ignoreChanges=true unconditionally: we have already
+                            // decided the fate of any unsaved edits above (saved,
+                            // or deliberately left to be discarded), so Ghidra must
+                            // never fall back to its own interactive "Save
+                            // changes?" dialog here -- that call blocks the Swing
+                            // event thread (and with it every other MCP request,
+                            // since they all funnel through invokeAndWait) until a
+                            // human clicks it, which is exactly the hang this
+                            // parameter exists to prevent.
+                            pm.closeProgram(program, true);
+                            closedCount.incrementAndGet();
                         }
                     }
                 } catch (Exception e) {
@@ -381,10 +1248,10 @@ public class ProgramScriptService {
     }
 
     /**
-     * List all physical address spaces in the program.
-     * Returns only RAM and CODE spaces; excludes pseudo-spaces (EXTERNAL, STACK, etc.)
-     * and overlay spaces. Useful for embedded/microcontroller targets where multiple
-     * address spaces exist and plain hex addresses may be ambiguous.
+     * List the program's address spaces. Returns physical RAM/CODE spaces plus
+     * overlay spaces (marked is_overlay). Excludes pseudo-spaces (EXTERNAL, STACK,
+     * etc.). Useful for embedded/microcontroller and overlay-bearing targets where
+     * plain hex addresses may be ambiguous.
      */
     @McpTool(path = "/get_address_spaces",
              description = "List all physical address spaces in the program. On programs with multiple "
@@ -393,7 +1260,10 @@ public class ProgramScriptService {
                          + "Also check addressable_unit_size: a value > 1 means the space is word-addressed "
                          + "(e.g., AVR code space uses 2-byte words). MCP tools and Ghidra both use word "
                          + "addresses natively for such spaces — code:001478 is word 0x1478, not byte 0x1478. "
-                         + "Do NOT multiply or divide addresses seen in Ghidra output; use them as-is.",
+                         + "Do NOT multiply or divide addresses seen in Ghidra output; use them as-is. "
+                         + "Overlay spaces are also listed, each marked is_overlay=true with its "
+                         + "overlayed_space (base). Address an overlay location as <overlay>::<hex> "
+                         + "(e.g., cli.Initial::00010000) — overlay names are case-sensitive.",
              category = "program")
     public Response getAddressSpaces(
             @Param(value = "program", description = "Target program name (omit to use the active program — always specify when multiple programs are open)", defaultValue = "") String programName) {
@@ -402,6 +1272,7 @@ public class ProgramScriptService {
         Program program = pe.program();
 
         List<Map<String, Object>> spaces = buildAddressSpacesList(program);
+        spaces.addAll(buildOverlaySpacesList(program));
         return Response.ok(JsonHelper.mapOf("address_spaces", spaces, "count", spaces.size()));
     }
 
@@ -432,7 +1303,37 @@ public class ProgramScriptService {
                 "addressable_unit_size", unitSize,
                 "size_bytes",            sizeBytes,
                 "address_size_bits",     space.getSize(),
-                "is_default",            space == defaultSpace
+                "is_default",            space == defaultSpace,
+                "is_overlay",            Boolean.FALSE
+            ));
+        }
+        return spaces;
+    }
+
+    /**
+     * Build JSON entries for the program's overlay address spaces, each marked
+     * is_overlay=true with the name of the physical space it overlays. Kept
+     * SEPARATE from buildAddressSpacesList so get_current_program_info's
+     * has_multiple_address_spaces flag continues to reflect PHYSICAL ambiguity only.
+     */
+    private List<Map<String, Object>> buildOverlaySpacesList(Program program) {
+        List<Map<String, Object>> spaces = new ArrayList<>();
+        for (AddressSpace space : program.getAddressFactory().getAddressSpaces()) {
+            if (!space.isOverlaySpace()) continue;
+            String base = "";
+            if (space instanceof OverlayAddressSpace) {
+                AddressSpace overlayed = ((OverlayAddressSpace) space).getOverlayedSpace();
+                if (overlayed != null) base = overlayed.getName();
+            }
+            int unitSize = space.getAddressableUnitSize();
+            spaces.add(JsonHelper.mapOf(
+                "name",                  space.getName(),
+                "start",                 space.getMinAddress().toString(false),
+                "end",                   space.getMaxAddress().toString(false),
+                "addressable_unit_size", unitSize,
+                "address_size_bits",     space.getSize(),
+                "is_overlay",            Boolean.TRUE,
+                "overlayed_space",       base
             ));
         }
         return spaces;
@@ -454,6 +1355,11 @@ public class ProgramScriptService {
 
         List<Map<String, Object>> addressSpaces = buildAddressSpacesList(program);
         boolean multiSpace = addressSpaces.size() > 1;
+        List<Map<String, Object>> overlaySpaces = buildOverlaySpacesList(program);
+        // Combine for the address_spaces array so overlays are visible here too
+        // (matches /get_address_spaces). multiSpace is computed BEFORE the
+        // append so it continues to reflect physical ambiguity only.
+        addressSpaces.addAll(overlaySpaces);
 
         Map<String, Object> info = new java.util.LinkedHashMap<>();
         info.put("name", program.getName());
@@ -474,11 +1380,18 @@ public class ProgramScriptService {
         info.put("memory_block_count", program.getMemory().getBlocks().length);
         info.put("address_spaces", addressSpaces);
         info.put("has_multiple_address_spaces", multiSpace);
+        info.put("has_overlay_spaces", !overlaySpaces.isEmpty());
+        info.put("overlay_space_count", overlaySpaces.size());
         if (multiSpace) {
             info.put("address_space_warning",
-                "This program has multiple address spaces. Plain hex addresses will resolve to the "
-                + "default space and may be incorrect. Use <space>:<hex> format (e.g., mem:1000) "
+                "This program has multiple physical address spaces. Plain hex addresses will resolve "
+                + "to the default space and may be incorrect. Use <space>:<hex> format (e.g., mem:1000) "
                 + "or call get_address_spaces first.");
+        } else if (!overlaySpaces.isEmpty()) {
+            info.put("address_space_warning",
+                "This program has overlay address spaces. Overlay addresses must be qualified as "
+                + "<overlay>::<hex> (e.g., " + overlaySpaces.get(0).get("name") + "::<hex>) — overlay "
+                + "names are case-sensitive. Plain hex resolves to the default physical space.");
         }
         return Response.ok(info);
     }
@@ -618,6 +1531,11 @@ public class ProgramScriptService {
         if (folderPath == null || folderPath.trim().isEmpty() || folderPath.equals("/")) {
             return Response.err("path parameter is required");
         }
+        // Containment: honor GHIDRA_MCP_PROJECT_FOLDER for this mutating op.
+        // No-op when no scope is set (default).
+        if (!SecurityConfig.getInstance().isPathInProjectScope(folderPath)) {
+            return Response.err("Access denied: path is outside the configured project scope.");
+        }
 
         try {
             ghidra.framework.model.DomainFolder current = project.getProjectData().getRootFolder();
@@ -650,6 +1568,13 @@ public class ProgramScriptService {
         if (filePath == null || filePath.trim().isEmpty()) {
             return Response.err("filePath parameter is required");
         }
+        // Containment: a destructive op must honor GHIDRA_MCP_PROJECT_FOLDER.
+        // The read side (FrontEndProgramProvider) already scopes which programs
+        // are returned; without this check a caller could delete files outside
+        // the configured scope. No-op when no scope is set (default).
+        if (!SecurityConfig.getInstance().isPathInProjectScope(filePath)) {
+            return Response.err("Access denied: path is outside the configured project scope.");
+        }
 
         try {
             ghidra.framework.model.DomainFile domainFile = project.getProjectData().getFile(filePath);
@@ -661,6 +1586,191 @@ public class ProgramScriptService {
             return Response.ok(JsonHelper.mapOf("success", true, "deleted", true, "filePath", filePath));
         } catch (Exception e) {
             return Response.err("Failed to delete file: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Resolve the active project across GUI, FrontEnd and headless modes.
+     *
+     * <p>GUI/FrontEnd reach it through the PluginTool; headless has no tool at
+     * all and answers via {@link ProgramProvider#getProject()}. Project-level
+     * tools must go through here rather than {@code getToolFromProvider()},
+     * which returns null headless and would make them GUI-only.
+     */
+    private ghidra.framework.model.Project resolveProject() {
+        PluginTool tool = getToolFromProvider();
+        if (tool != null && tool.getProject() != null) {
+            return tool.getProject();
+        }
+        return programProvider.getProject();
+    }
+
+    /** True if any open program is backed by the given project file path. */
+    private boolean isProgramOpenForPath(String filePath) {
+        for (Program prog : programProvider.getAllOpenPrograms()) {
+            ghidra.framework.model.DomainFile df = prog.getDomainFile();
+            if (df != null && df.getPathname().equalsIgnoreCase(filePath)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @McpTool(path = "/move_file", method = "POST",
+             description = "Move a program file to a different folder in the project, preserving all "
+                         + "analysis and documentation. Refuses when the program has unsaved changes "
+                         + "-- call save_program first -- rather than discarding them. A program that "
+                         + "is open but clean is closed, moved, then reopened at its new path.",
+             category = "project")
+    public Response moveFile(
+            @Param(value = "filePath", source = ParamSource.BODY,
+                   description = "Project file path to move, e.g. /Vanilla/1.00/D2Server.dll") String filePath,
+            @Param(value = "destFolder", source = ParamSource.BODY,
+                   description = "Destination project folder path, e.g. /Mods/PD2-S12") String destFolder) {
+        ghidra.framework.model.Project project = resolveProject();
+        if (project == null) {
+            return Response.err("No project is currently open");
+        }
+        if (filePath == null || filePath.trim().isEmpty()) {
+            return Response.err("filePath parameter is required");
+        }
+        if (destFolder == null || destFolder.trim().isEmpty()) {
+            return Response.err("destFolder parameter is required");
+        }
+        // Containment: a move is a delete from one scope plus a create in
+        // another, so BOTH ends must sit inside GHIDRA_MCP_PROJECT_FOLDER.
+        // Checking only the source would let a caller relocate a scoped file
+        // straight out of scope. No-op when no scope is set (default).
+        if (!SecurityConfig.getInstance().isPathInProjectScope(filePath)
+                || !SecurityConfig.getInstance().isPathInProjectScope(destFolder)) {
+            return Response.err("Access denied: path is outside the configured project scope.");
+        }
+
+        try {
+            ghidra.framework.model.ProjectData projectData = project.getProjectData();
+            ghidra.framework.model.DomainFile domainFile = projectData.getFile(filePath);
+            if (domainFile == null) {
+                return Response.err("File not found: " + filePath);
+            }
+            ghidra.framework.model.DomainFolder dest = projectData.getFolder(destFolder);
+            if (dest == null) {
+                return Response.err("Destination folder not found: " + destFolder);
+            }
+            ghidra.framework.model.DomainFolder parent = domainFile.getParent();
+            if (parent != null && parent.getPathname().equals(dest.getPathname())) {
+                return Response.ok(JsonHelper.mapOf(
+                        "success", true, "moved", false,
+                        "reason", "already in destination folder",
+                        "filePath", domainFile.getPathname()));
+            }
+            if (dest.getFile(domainFile.getName()) != null) {
+                return Response.err("Destination already contains a file named " + domainFile.getName()
+                        + " -- rename or remove it first");
+            }
+            // Never move on top of unsaved work. moveTo() would either fail or
+            // strand edits the caller still believes are pending, and saving on
+            // their behalf is equally wrong: an unreviewed autosave is not a
+            // side effect "move" should have. Refuse, and say what to do.
+            if (domainFile.isChanged()) {
+                return Response.err("Program has unsaved changes: call save_program "
+                        + "(or close_program) before moving " + filePath);
+            }
+
+            boolean wasOpen = isProgramOpenForPath(filePath);
+            if (wasOpen) {
+                // Ghidra refuses to move a file that is open in a tool. It is
+                // clean (checked above), so save=false discards nothing.
+                closeProgram(filePath, false);
+                // The close can swap the DomainFile instance out from under us.
+                domainFile = projectData.getFile(filePath);
+                if (domainFile == null) {
+                    return Response.err("File vanished while closing it: " + filePath);
+                }
+            }
+            // moveTo returns the RELOCATED DomainFile. The receiver keeps
+            // reporting its old pathname, so reading getPathname() off it
+            // reports a destination the file is not at -- measured live: a
+            // successful move to /Mods/PD2-S12 still answered
+            // "to": "/Vanilla/1.00/D2Server.dll". Anything chaining on that
+            // path then operates on a file that no longer exists there.
+            ghidra.framework.model.DomainFile movedFile = domainFile.moveTo(dest);
+            String newPath = movedFile != null ? movedFile.getPathname()
+                    : dest.getPathname() + "/" + domainFile.getName();
+            boolean reopened = false;
+            if (wasOpen) {
+                reopened = openProgramFromProject(newPath, false) instanceof Response.Ok;
+            }
+            return Response.ok(JsonHelper.mapOf(
+                    "success", true, "moved", true,
+                    "from", filePath, "to", newPath,
+                    "was_open", wasOpen, "reopened", reopened));
+        } catch (Exception e) {
+            return Response.err("Failed to move file: " + e.getMessage());
+        }
+    }
+
+    @McpTool(path = "/move_folder", method = "POST",
+             description = "Move a project folder (and everything under it) into another folder. "
+                         + "Refuses to move a folder into itself or into its own descendant, which "
+                         + "would orphan the subtree.",
+             category = "project")
+    public Response moveFolder(
+            @Param(value = "sourcePath", source = ParamSource.BODY,
+                   description = "Project folder path to move, e.g. /Vanilla/1.00") String sourcePath,
+            @Param(value = "destPath", source = ParamSource.BODY,
+                   description = "Destination parent folder path, e.g. /Mods") String destPath) {
+        ghidra.framework.model.Project project = resolveProject();
+        if (project == null) {
+            return Response.err("No project is currently open");
+        }
+        if (sourcePath == null || sourcePath.trim().isEmpty()) {
+            return Response.err("sourcePath parameter is required");
+        }
+        if (destPath == null || destPath.trim().isEmpty()) {
+            return Response.err("destPath parameter is required");
+        }
+        if (!SecurityConfig.getInstance().isPathInProjectScope(sourcePath)
+                || !SecurityConfig.getInstance().isPathInProjectScope(destPath)) {
+            return Response.err("Access denied: path is outside the configured project scope.");
+        }
+
+        try {
+            ghidra.framework.model.ProjectData projectData = project.getProjectData();
+            ghidra.framework.model.DomainFolder source = projectData.getFolder(sourcePath);
+            if (source == null) {
+                return Response.err("Source folder not found: " + sourcePath);
+            }
+            if (source.getParent() == null) {
+                return Response.err("Cannot move the project root folder");
+            }
+            ghidra.framework.model.DomainFolder dest = projectData.getFolder(destPath);
+            if (dest == null) {
+                return Response.err("Destination folder not found: " + destPath);
+            }
+            // A folder cannot become its own ancestor. Ghidra's own error for
+            // this is opaque, and the subtree is unreachable afterwards, so
+            // catch it here where we can say what actually went wrong.
+            String sourcePrefix = source.getPathname().endsWith("/")
+                    ? source.getPathname() : source.getPathname() + "/";
+            if (dest.getPathname().equals(source.getPathname())
+                    || dest.getPathname().startsWith(sourcePrefix)) {
+                return Response.err("Cannot move " + source.getPathname()
+                        + " into itself or its own descendant " + dest.getPathname());
+            }
+            if (dest.getFolder(source.getName()) != null) {
+                return Response.err("Destination already contains a folder named " + source.getName());
+            }
+            // Same trap as move_file: moveTo returns the RELOCATED folder and
+            // the receiver keeps reporting its old pathname. Report the handle
+            // Ghidra hands back, never the one we called through.
+            ghidra.framework.model.DomainFolder movedFolder = source.moveTo(dest);
+            String newPath = movedFolder != null ? movedFolder.getPathname()
+                    : dest.getPathname() + "/" + source.getName();
+            return Response.ok(JsonHelper.mapOf(
+                    "success", true, "moved", true,
+                    "from", sourcePath, "to", newPath));
+        } catch (Exception e) {
+            return Response.err("Failed to move folder: " + e.getMessage());
         }
     }
 
@@ -680,7 +1790,13 @@ public class ProgramScriptService {
         for (Program prog : programProvider.getAllOpenPrograms()) {
             if (prog.getDomainFile() != null
                     && prog.getDomainFile().getPathname().equalsIgnoreCase(filePath)) {
-                pm.closeProgram(prog, false);
+                // ignoreChanges=true: this only runs to clear the way for
+                // delete_file's delete() call right after, so there is
+                // nothing worth saving. false would risk Ghidra's own
+                // interactive "Save changes?" dialog, which blocks the Swing
+                // event thread -- and with it every other MCP request -- until
+                // a human dismisses it.
+                pm.closeProgram(prog, true);
                 return;
             }
         }
@@ -752,37 +1868,90 @@ public class ProgramScriptService {
                 return Response.err("Failed to open program: " + path);
             }
 
-            ghidra.program.util.GhidraProgramUtilities.markProgramNotToAskToAnalyze(program);
+            // getDomainObject registered US (tool) as a consumer. ProgramManager
+            // takes its OWN consumer in openProgram below, so ours must be handed
+            // back -- otherwise the DomainObject keeps a consumer forever and the
+            // DomainFile stays permanently "in use": undoCheckout then fails with
+            // "<name> is in use" and keeps failing until Ghidra restarts, while
+            // close_program reports success with released_cache=false because
+            // neither the ProgramManager nor the provider cache holds the stray
+            // reference. Measured 2026-08-10: 140 exclusive checkouts stranded on
+            // a shared project by a read-only verification sweep, clearable only
+            // by restarting Ghidra.
+            try {
+                ghidra.program.util.GhidraProgramUtilities.markProgramNotToAskToAnalyze(program);
 
-            boolean analyzed = false;
-            if (autoAnalyze) {
-                analyzed = runAutoAnalysisAndPersistFlags(program, true);
-            } else {
-                try {
-                    suppressAnalysisPrompt(program);
-                } catch (Exception e) {
-                    Msg.warn(this, "Failed to save analysis prompt flags: " + e.getMessage());
+                boolean analyzed = false;
+                if (autoAnalyze) {
+                    analyzed = runAutoAnalysisAndPersistFlags(program, true);
+                } else {
+                    try {
+                        suppressAnalysisPrompt(program);
+                    } catch (Exception e) {
+                        Msg.warn(this, "Failed to save analysis prompt flags: " + e.getMessage());
+                    }
                 }
+
+                // Capture before releasing: after the release our only guarantee
+                // that the Program is still alive is the ProgramManager's consumer.
+                String programName = program.getName();
+                int functionCount = program.getFunctionManager().getFunctionCount();
+
+                // Open after the analysis flags are persisted so CodeBrowser does not prompt.
+                Program finalProgram = program;
+                SwingUtilities.invokeAndWait(() -> {
+                    pm.openProgram(finalProgram);
+                    pm.setCurrentProgram(finalProgram);
+                });
+
+                return Response.ok(JsonHelper.mapOf(
+                    "success", true,
+                    "message", "Program opened successfully",
+                    "name", programName,
+                    "path", path,
+                    "auto_analyzed", analyzed,
+                    "function_count", functionCount
+                ));
+            } finally {
+                // Unconditional: on the failure paths nothing else holds the
+                // program, so releasing is both correct and the only way the
+                // checkout can ever be undone.
+                program.release(tool);
             }
-
-            // Open after the analysis flags are persisted so CodeBrowser does not prompt.
-            Program finalProgram = program;
-            SwingUtilities.invokeAndWait(() -> {
-                pm.openProgram(finalProgram);
-                pm.setCurrentProgram(finalProgram);
-            });
-
-            return Response.ok(JsonHelper.mapOf(
-                "success", true,
-                "message", "Program opened successfully",
-                "name", program.getName(),
-                "path", path,
-                "auto_analyzed", analyzed,
-                "function_count", program.getFunctionManager().getFunctionCount()
-            ));
         } catch (Exception e) {
-            return Response.err("Failed to open program: " + e.getMessage());
+            return Response.err("Failed to open program: " + describeOpenFailure(e, path));
         }
+    }
+
+    /**
+     * Turn an open failure into something the caller can act on.
+     *
+     * <p>A program built against an older SLEIGH language revision opens read-ONLY
+     * but refuses a read-write open, surfacing here as a bare
+     * {@code "Minor language change 4.6 -> 4.7"}. That names the symptom and not
+     * the cure, and this code path cannot perform the cure itself: every
+     * FrontEnd-side open passes {@code okToUpgrade=false}, and an upgrade also
+     * needs an exclusive checkout. Point at the tool that does both.
+     */
+    public static String describeOpenFailure(Exception e, String path) {
+        String message = e.getMessage() != null ? e.getMessage() : e.toString();
+        if (message.contains("language change") || message.contains("older version of Ghidra")) {
+            return message
+                + " -- " + path + " was built against an older SLEIGH language revision than this"
+                + " Ghidra ships, so it can only be opened read-only until it is upgraded."
+                + " An upgrade requires an exclusive checkout and cannot be done from here."
+                + " Run: python tools/upgrade_project_language.py --apply --folder "
+                + parentFolderOf(path);
+        }
+        return message;
+    }
+
+    private static String parentFolderOf(String path) {
+        if (path == null) {
+            return "/";
+        }
+        int lastSlash = path.lastIndexOf('/');
+        return lastSlash > 0 ? path.substring(0, lastSlash) : "/";
     }
 
     // ========================================================================
@@ -803,7 +1972,17 @@ public class ProgramScriptService {
             return Response.err("file_path is required");
         }
 
-        File file = new File(filePath);
+        // Enforce GHIDRA_MCP_FILE_ROOT (when configured) for this filesystem-path endpoint,
+        // matching the headless import path. No-op when the root is unset (paths accepted
+        // as-is), so default localhost behavior is unchanged.
+        SecurityConfig security = SecurityConfig.getInstance();
+        java.nio.file.Path resolved = security.resolveWithinFileRoot(filePath);
+        if (resolved == null) {
+            return Response.err("Path is outside the allowed file root ("
+                    + security.getFileRoot() + "): " + filePath);
+        }
+
+        File file = resolved.toFile();
         if (!file.exists()) {
             return Response.err("File not found: " + filePath);
         }
@@ -871,12 +2050,29 @@ public class ProgramScriptService {
                 loadResults.save(ghidra.util.task.TaskMonitor.DUMMY);
             }
 
-            // Suppress the "Analysis Options" dialog — we handle analysis programmatically
-            ghidra.program.util.GhidraProgramUtilities.markProgramNotToAskToAnalyze(program);
+            // NOTE: do NOT call markProgramNotToAskToAnalyze here, ahead of the
+            // branches below. It mutates the program DB, and AutoAnalysisManager's
+            // own DomainObjectListener reacts to *any* program change by scheduling
+            // a background "Auto Analysis" task (the same mechanism documented on
+            // saveWithRetry above) -- confirmed root cause of a real, intermittent
+            // bug: that premature background pass could already be "actively
+            // running" by the time runAutoAnalysisAndPersistFlags below called its
+            // own startAnalysis(), which per its own javadoc is then a no-op
+            // ("if actively running... return immediately"), leaving
+            // waitForAnalysis() to wait on whatever partial pass Ghidra's own
+            // listener decided to run instead of the real one. Reproduced live:
+            // a fresh import came back with function_count 9 instead of 530, with
+            // analyzed:true and no error anywhere. Both branches below already set
+            // this flag themselves, inside their own transaction, so the call here
+            // was pure redundant risk with no benefit.
 
             boolean autoAnalyzed = false;
             if (autoAnalyze) {
-                autoAnalyzed = runAutoAnalysisAndPersistFlags(program, false);
+                // force=true (reAnalyzeAll first): unconditionally re-queues every
+                // analyzer regardless of anything Ghidra's own listeners may have
+                // already scheduled, closing the race described above. Matches
+                // /reanalyze, which has never shown this symptom.
+                autoAnalyzed = runAutoAnalysisAndPersistFlags(program, true);
             } else {
                 try {
                     suppressAnalysisPrompt(program);
@@ -1134,6 +2330,20 @@ public class ProgramScriptService {
             @Param(value = "script_path", source = ParamSource.BODY) String scriptPath,
             @Param(value = "args", source = ParamSource.BODY, defaultValue = "") String scriptArgs,
             @Param(value = "program", description = "Target program name", defaultValue = "") String programName) {
+        return runGhidraScript(scriptPath, scriptArgs, programName, 0);
+    }
+
+    public Response runGhidraScript(String scriptPath, String scriptArgs, String programName, int timeoutSeconds) {
+        // Defense in depth: the script-execution gate belongs on the sink, not
+        // only on the callers. runGhidraScriptWithCapture already checks this
+        // before delegating here; enforcing it again means no current or future
+        // caller (including any re-wired /run_script route) can reach arbitrary
+        // Ghidra script execution with GHIDRA_MCP_ALLOW_SCRIPTS unset.
+        if (!SecurityConfig.getInstance().areScriptsAllowed()) {
+            return Response.err("Script execution disabled. Set GHIDRA_MCP_ALLOW_SCRIPTS=1 "
+                + "(and GHIDRA_MCP_AUTH_TOKEN if exposing beyond loopback) to enable. "
+                + "runGhidraScript executes any script resolvable via the Ghidra script path.");
+        }
         ServiceUtils.ProgramOrError pe = ServiceUtils.getProgramOrError(programProvider, programName);
         if (pe.hasError()) return pe.error();
         Program program = pe.program();
@@ -1147,11 +2357,20 @@ public class ProgramScriptService {
         // Track whether we copied the script (for cleanup)
         final File[] copiedScript = {null};
 
+        // Holders so the catch block can surface OSGi build/activate output
+        // captured into scriptWriter before a failure. The PrintWriter holder
+        // lets the failure path flush buffered output into the StringWriter
+        // before reading it, otherwise the captured text can be truncated.
+        final StringWriter[] scriptWriterHolder = {null};
+        final PrintWriter[] scriptPrintWriterHolder = {null};
+        final TimeoutTaskMonitor[] scriptMonitorHolder = {null};
+
         // Get the PluginTool for script state (GUI mode only)
         final PluginTool pluginTool = getToolFromProvider();
 
         try {
             SwingUtilities.invokeAndWait(() -> {
+                StringWriter scriptWriter = new StringWriter();
                 try {
                     // Capture console output
                     PrintStream captureStream = new PrintStream(outputCapture);
@@ -1214,6 +2433,19 @@ public class ProgramScriptService {
                         resultMsg.append("Warning: Could not copy script to ~/ghidra_scripts/: ").append(e.getMessage()).append("\n");
                     }
 
+                    try {
+                        ensureScriptBundleHostInitialized(scriptFileForExecution.getParentFile());
+                    } catch (Exception e) {
+                        resultMsg.append("ERROR: Could not initialize Ghidra script bundle host for: ")
+                                .append(scriptFileForExecution.getParentFile().getAbsolutePath())
+                                .append("\n")
+                                .append(e.getClass().getSimpleName())
+                                .append(": ")
+                                .append(e.getMessage())
+                                .append("\n");
+                        return;
+                    }
+
                     generic.jar.ResourceFile scriptFile = new generic.jar.ResourceFile(scriptFileForExecution);
 
                     resultMsg.append("Found script: ").append(scriptFile.getAbsolutePath()).append("\n");
@@ -1234,8 +2466,9 @@ public class ProgramScriptService {
                     resultMsg.append("Script provider: ").append(provider.getClass().getSimpleName()).append("\n");
 
                     // Create script instance
-                    StringWriter scriptWriter = new StringWriter();
                     PrintWriter scriptPrintWriter = new PrintWriter(scriptWriter);
+                    scriptWriterHolder[0] = scriptWriter;
+                    scriptPrintWriterHolder[0] = scriptPrintWriter;
 
                     ghidra.app.script.GhidraScript script = provider.getScriptInstance(scriptFile, scriptPrintWriter);
                     if (script == null) {
@@ -1252,7 +2485,18 @@ public class ProgramScriptService {
                         scriptState = new ghidra.app.script.GhidraState(null, null, program, location, null, null);
                     }
 
-                    ghidra.util.task.TaskMonitor scriptMonitor = new ghidra.util.task.ConsoleTaskMonitor();
+                    ghidra.util.task.TaskMonitor scriptMonitor;
+                    if (timeoutSeconds > 0) {
+                        TimeoutTaskMonitor timeoutMonitor = TimeoutTaskMonitor.timeoutIn(
+                                timeoutSeconds,
+                                TimeUnit.SECONDS,
+                                new ConsoleTaskMonitor());
+                        scriptMonitorHolder[0] = timeoutMonitor;
+                        scriptMonitor = timeoutMonitor;
+                    }
+                    else {
+                        scriptMonitor = new ConsoleTaskMonitor();
+                    }
 
                     script.set(scriptState, scriptMonitor, scriptPrintWriter);
 
@@ -1280,6 +2524,11 @@ public class ProgramScriptService {
                     resultMsg.append("\n=== SCRIPT COMPLETED SUCCESSFULLY ===\n");
 
                 } catch (Exception e) {
+                    String scriptOutput = scriptWriter.toString();
+                    if (!scriptOutput.isEmpty()) {
+                        resultMsg.append("\n--- SCRIPT BUILD OUTPUT ---\n");
+                        resultMsg.append(scriptOutput).append("\n");
+                    }
                     resultMsg.append("\n=== SCRIPT EXECUTION ERROR ===\n");
                     resultMsg.append("Error: ").append(e.getClass().getSimpleName()).append(": ").append(e.getMessage()).append("\n");
 
@@ -1288,8 +2537,33 @@ public class ProgramScriptService {
                     e.printStackTrace(pw);
                     resultMsg.append("Stack trace:\n").append(sw.toString()).append("\n");
 
+                    // Surface any build/activate output that was captured into the
+                    // script writer before the failure (e.g. OSGi/Felix compile
+                    // errors from JavaScriptProvider.activateAll()). Flush the
+                    // PrintWriter first so buffered text reaches the StringWriter,
+                    // and bound the result so a verbose compiler failure can't
+                    // blow up the response payload.
+                    try {
+                        PrintWriter pw2 = scriptPrintWriterHolder[0];
+                        if (pw2 != null) {
+                            pw2.flush();
+                        }
+                        StringWriter sw2 = scriptWriterHolder[0];
+                        if (sw2 != null) {
+                            String capturedBuild = sw2.toString();
+                            if (!capturedBuild.isEmpty()) {
+                                resultMsg.append("--- BUILD/ACTIVATE OUTPUT ---\n")
+                                        .append(boundTail(capturedBuild, MAX_BUILD_OUTPUT_CHARS))
+                                        .append("\n");
+                            }
+                        }
+                    } catch (Throwable ignore) { /* scriptWriter may be unavailable */ }
+
                     Msg.error(this, "Script execution failed: " + scriptPath, e);
                 } finally {
+                    if (scriptMonitorHolder[0] != null) {
+                        scriptMonitorHolder[0].cancel();
+                    }
                     // Restore original output streams
                     System.setOut(originalOut);
                     System.setErr(originalErr);
@@ -1314,7 +2588,9 @@ public class ProgramScriptService {
             Msg.error(this, "Failed to execute on Swing thread", e);
         }
 
-        return Response.text(resultMsg.toString());
+        return Response.ok(JsonHelper.mapOf(
+                "success", success.get(),
+                "console_output", resultMsg.toString()));
     }
 
     @McpTool(path = "/run_script_inline", method = "POST", description = "Execute inline Ghidra script code. Pass the full Java source as the 'code' body parameter. Gated by GHIDRA_MCP_ALLOW_SCRIPTS=1 (v5.4.1+).", category = "program")
@@ -1416,8 +2692,10 @@ public class ProgramScriptService {
             if (!tempScript.exists()) {
                 // File was never written or was already cleaned up — nothing to do.
             } else {
-                boolean succeeded = responseHolder[0] != null
-                    && responseHolder[0].toJson().contains("SCRIPT COMPLETED SUCCESSFULLY");
+                boolean succeeded = false;
+                if (responseHolder[0] instanceof Response.Ok ok && ok.data() instanceof Map<?, ?> dataMap) {
+                    succeeded = Boolean.TRUE.equals(dataMap.get("success"));
+                }
                 if (succeeded) {
                     // Clean run: remove the source file immediately.
                     if (!tempScript.delete()) tempScript.deleteOnExit();
@@ -1887,6 +3165,9 @@ public class ProgramScriptService {
         if (scriptName == null || scriptName.isEmpty()) {
             return Response.err("Script name is required");
         }
+        if (timeoutSeconds <= 0 || timeoutSeconds > MAX_SCRIPT_TIMEOUT_SECONDS) {
+            return Response.err("timeout_seconds must be between 1 and " + MAX_SCRIPT_TIMEOUT_SECONDS + " seconds");
+        }
 
         // Fail fast with a clear "program not found" error before doing
         // the script-file search. The Program object isn't used in this
@@ -1952,12 +3233,21 @@ public class ProgramScriptService {
             // "It is fixed for run_script_inline but not fixed for
             //  run_ghidra_script, which always runs for the current program."
             long startTime = System.currentTimeMillis();
-            Response scriptResponse = runGhidraScript(scriptFile.getAbsolutePath(), scriptArgs, programName);
+            Response scriptResponse = runGhidraScript(
+                    scriptFile.getAbsolutePath(), scriptArgs, programName, timeoutSeconds);
             double executionTime = (System.currentTimeMillis() - startTime) / 1000.0;
 
-            // Extract output text from the Response
+            // Extract the structured result from runGhidraScript's own response
+            // rather than string-matching its serialized JSON.
+            boolean succeeded = false;
             String output = scriptResponse.toJson();
-            boolean succeeded = output.contains("SCRIPT COMPLETED SUCCESSFULLY");
+            if (scriptResponse instanceof Response.Ok ok && ok.data() instanceof Map<?, ?> dataMap) {
+                succeeded = Boolean.TRUE.equals(dataMap.get("success"));
+                Object consoleOutput = dataMap.get("console_output");
+                if (consoleOutput != null) output = consoleOutput.toString();
+            } else if (scriptResponse instanceof Response.Err err) {
+                output = err.message();
+            }
 
             return Response.ok(JsonHelper.mapOf(
                 "success", succeeded,
@@ -1969,223 +3259,6 @@ public class ProgramScriptService {
 
         } catch (Exception e) {
             return Response.err(e.getMessage());
-        }
-    }
-
-    // ========================================================================
-    // Script Generation
-    // ========================================================================
-
-    /**
-     * Generate script content based on workflow type and parameters.
-     * Dispatches to specific script generators based on workflowType.
-     */
-    public Response generateScriptContent(String purpose, String workflowType, Map<String, Object> parameters) {
-        if (parameters == null) {
-            parameters = new HashMap<>();
-        }
-
-        switch (workflowType) {
-            case "document_functions":
-                return Response.text(generateDocumentFunctionsScript(purpose, parameters));
-            case "fix_ordinals":
-                return Response.text(generateFixOrdinalsScript(purpose, parameters));
-            case "bulk_rename":
-                return Response.text(generateBulkRenameScript(purpose, parameters));
-            case "analyze_structures":
-                return Response.text(generateAnalyzeStructuresScript(purpose, parameters));
-            case "find_patterns":
-                return Response.text(generateFindPatternsScript(purpose, parameters));
-            case "custom":
-            default:
-                return Response.text(generateCustomScript(purpose, parameters));
-        }
-    }
-
-    private String generateDocumentFunctionsScript(String purpose, Map<String, Object> parameters) {
-        return "import ghidra.app.script.GhidraScript;\n" +
-               "import ghidra.program.model.listing.Function;\n" +
-               "import ghidra.program.model.listing.FunctionManager;\n\n" +
-               "public class DocumentFunctions extends GhidraScript {\n" +
-               "    public void run() throws Exception {\n" +
-               "        FunctionManager funcMgr = currentProgram.getFunctionManager();\n" +
-               "        int documentedCount = 0;\n" +
-               "        \n" +
-               "        // Purpose: " + purpose + "\n" +
-               "        for (Function func : funcMgr.getFunctions(true)) {\n" +
-               "            try {\n" +
-               "                // Add custom documentation logic here\n" +
-               "                // Example: set_plate_comment(func.getEntryPoint(), \"Documented: \" + func.getName());\n" +
-               "                documentedCount++;\n" +
-               "                \n" +
-               "                if (documentedCount % 100 == 0) {\n" +
-               "                    println(\"Processed \" + documentedCount + \" functions\");\n" +
-               "                }\n" +
-               "            } catch (Exception e) {\n" +
-               "                println(\"Error processing \" + func.getName() + \": \" + e.getMessage());\n" +
-               "            }\n" +
-               "        }\n" +
-               "        \n" +
-               "        println(\"Document functions workflow complete! Processed \" + documentedCount + \" functions.\");\n" +
-               "    }\n" +
-               "}\n";
-    }
-
-    private String generateFixOrdinalsScript(String purpose, Map<String, Object> parameters) {
-        return "import ghidra.app.script.GhidraScript;\n" +
-               "import ghidra.program.model.symbol.ExternalManager;\n" +
-               "import ghidra.program.model.symbol.ExternalLocation;\n" +
-               "import ghidra.program.model.symbol.ExternalLocationIterator;\n\n" +
-               "public class FixOrdinalImports extends GhidraScript {\n" +
-               "    public void run() throws Exception {\n" +
-               "        ExternalManager extMgr = currentProgram.getExternalManager();\n" +
-               "        int fixedCount = 0;\n" +
-               "        \n" +
-               "        // Purpose: " + purpose + "\n" +
-               "        for (String libName : extMgr.getExternalLibraryNames()) {\n" +
-               "            ExternalLocationIterator iter = extMgr.getExternalLocations(libName);\n" +
-               "            while (iter.hasNext()) {\n" +
-               "                ExternalLocation extLoc = iter.next();\n" +
-               "                String label = extLoc.getLabel();\n" +
-               "                \n" +
-               "                // Check if this is an ordinal import (e.g., \"Ordinal_123\")\n" +
-               "                if (label.startsWith(\"Ordinal_\")) {\n" +
-               "                    try {\n" +
-               "                        // Add logic to determine correct function name from ordinal\n" +
-               "                        // Then rename: extLoc.setName(..., correctName, SourceType.USER_DEFINED);\n" +
-               "                        fixedCount++;\n" +
-               "                    } catch (Exception e) {\n" +
-               "                        println(\"Error fixing ordinal \" + label + \": \" + e.getMessage());\n" +
-               "                    }\n" +
-               "                }\n" +
-               "            }\n" +
-               "        }\n" +
-               "        \n" +
-               "        println(\"Fix ordinals workflow complete! Fixed \" + fixedCount + \" ordinal imports.\");\n" +
-               "    }\n" +
-               "}\n";
-    }
-
-    private String generateBulkRenameScript(String purpose, Map<String, Object> parameters) {
-        return "import ghidra.app.script.GhidraScript;\n" +
-               "import ghidra.program.model.symbol.SymbolTable;\n" +
-               "import ghidra.program.model.symbol.Symbol;\n" +
-               "import ghidra.program.model.symbol.SourceType;\n\n" +
-               "public class BulkRenameSymbols extends GhidraScript {\n" +
-               "    public void run() throws Exception {\n" +
-               "        SymbolTable symTable = currentProgram.getSymbolTable();\n" +
-               "        int renamedCount = 0;\n" +
-               "        \n" +
-               "        // Purpose: " + purpose + "\n" +
-               "        for (Symbol symbol : symTable.getAllSymbols(true)) {\n" +
-               "            try {\n" +
-               "                String currentName = symbol.getName();\n" +
-               "                // Add pattern matching logic here\n" +
-               "                // Example: if (currentName.matches(\"var_.*\")) { newName = ... }\n" +
-               "                renamedCount++;\n" +
-               "            } catch (Exception e) {\n" +
-               "                println(\"Error renaming symbol: \" + e.getMessage());\n" +
-               "            }\n" +
-               "        }\n" +
-               "        \n" +
-               "        println(\"Bulk rename workflow complete! Renamed \" + renamedCount + \" symbols.\");\n" +
-               "    }\n" +
-               "}\n";
-    }
-
-    private String generateAnalyzeStructuresScript(String purpose, Map<String, Object> parameters) {
-        return "import ghidra.app.script.GhidraScript;\n" +
-               "import ghidra.program.model.data.DataType;\n" +
-               "import ghidra.program.model.data.DataTypeManager;\n" +
-               "import ghidra.program.model.data.Structure;\n\n" +
-               "public class AnalyzeStructures extends GhidraScript {\n" +
-               "    public void run() throws Exception {\n" +
-               "        DataTypeManager dtMgr = currentProgram.getDataTypeManager();\n" +
-               "        int analyzedCount = 0;\n" +
-               "        \n" +
-               "        // Purpose: " + purpose + "\n" +
-               "        for (DataType dt : dtMgr.getAllDataTypes()) {\n" +
-               "            if (dt instanceof Structure) {\n" +
-               "                try {\n" +
-               "                    Structure struct = (Structure) dt;\n" +
-               "                    // Add analysis logic here\n" +
-               "                    analyzedCount++;\n" +
-               "                } catch (Exception e) {\n" +
-               "                    println(\"Error analyzing \" + dt.getName() + \": \" + e.getMessage());\n" +
-               "                }\n" +
-               "            }\n" +
-               "        }\n" +
-               "        \n" +
-               "        println(\"Analyze structures workflow complete! Analyzed \" + analyzedCount + \" structures.\");\n" +
-               "    }\n" +
-               "}\n";
-    }
-
-    private String generateFindPatternsScript(String purpose, Map<String, Object> parameters) {
-        return "import ghidra.app.script.GhidraScript;\n" +
-               "import ghidra.program.model.listing.Function;\n" +
-               "import ghidra.program.model.listing.FunctionManager;\n\n" +
-               "public class FindPatterns extends GhidraScript {\n" +
-               "    public void run() throws Exception {\n" +
-               "        FunctionManager funcMgr = currentProgram.getFunctionManager();\n" +
-               "        int foundCount = 0;\n" +
-               "        \n" +
-               "        // Purpose: " + purpose + "\n" +
-               "        for (Function func : funcMgr.getFunctions(true)) {\n" +
-               "            try {\n" +
-               "                // Add pattern matching logic here\n" +
-               "                // Example: if (matchesPattern(func)) { handleMatch(func); }\n" +
-               "                foundCount++;\n" +
-               "            } catch (Exception e) {\n" +
-               "                println(\"Error processing \" + func.getName() + \": \" + e.getMessage());\n" +
-               "            }\n" +
-               "        }\n" +
-               "        \n" +
-               "        println(\"Find patterns workflow complete! Found \" + foundCount + \" matching patterns.\");\n" +
-               "    }\n" +
-               "}\n";
-    }
-
-    private String generateCustomScript(String purpose, Map<String, Object> parameters) {
-        return "import ghidra.app.script.GhidraScript;\n" +
-               "import ghidra.program.model.listing.Function;\n" +
-               "import ghidra.program.model.listing.FunctionManager;\n\n" +
-               "public class CustomAnalysis extends GhidraScript {\n" +
-               "    public void run() throws Exception {\n" +
-               "        // Purpose: " + purpose + "\n" +
-               "        println(\"Custom analysis script started...\");\n" +
-               "        \n" +
-               "        // Add your custom analysis logic here\n" +
-               "        FunctionManager funcMgr = currentProgram.getFunctionManager();\n" +
-               "        int count = 0;\n" +
-               "        \n" +
-               "        for (Function func : funcMgr.getFunctions(true)) {\n" +
-               "            // Add logic here\n" +
-               "            count++;\n" +
-               "        }\n" +
-               "        \n" +
-               "        println(\"Custom analysis complete! Processed \" + count + \" items.\");\n" +
-               "    }\n" +
-               "}\n";
-    }
-
-    /**
-     * Generate a script filename based on the workflow type.
-     */
-    public String generateScriptName(String workflowType) {
-        switch (workflowType) {
-            case "document_functions":
-                return "DocumentFunctions.java";
-            case "fix_ordinals":
-                return "FixOrdinalImports.java";
-            case "bulk_rename":
-                return "BulkRenameSymbols.java";
-            case "analyze_structures":
-                return "AnalyzeStructures.java";
-            case "find_patterns":
-                return "FindPatterns.java";
-            default:
-                return "CustomAnalysis.java";
         }
     }
 

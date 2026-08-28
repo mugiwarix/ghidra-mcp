@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main, dev, develop ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main, dev, develop ]
 
 # OSSF Scorecard Token-Permissions: default to read-only so any job
 # without an explicit permissions block can only read repo contents.
@@ -22,10 +22,10 @@ jobs:
         java-version: [ '21' ]
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Set up Java
-      uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9  # v4
+      uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5.6.0
       with:
         java-version: ${{ matrix.java-version }}
         distribution: 'temurin'
@@ -33,17 +33,17 @@ jobs:
 
     - name: Cache Ghidra installation
       id: cache-ghidra
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: /tmp/ghidra
-        key: ghidra-12.1-PUBLIC-20260513
+        key: ghidra-12.1.2-PUBLIC-20260605
 
     - name: Download Ghidra
       if: steps.cache-ghidra.outputs.cache-hit != 'true'
       run: |
-        echo "Downloading Ghidra 12.1..."
+        echo "Downloading Ghidra 12.1.2..."
         curl -sL -o /tmp/ghidra.zip \
-          "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1_build/ghidra_12.1_PUBLIC_20260513.zip"
+          "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.2_build/ghidra_12.1.2_PUBLIC_20260605.zip"
         mkdir -p /tmp/ghidra
         unzip -q /tmp/ghidra.zip -d /tmp/ghidra
         rm /tmp/ghidra.zip
@@ -51,7 +51,7 @@ jobs:
     - name: Install Ghidra JARs to Maven local repository
       run: |
         GHIDRA_DIR=$(find /tmp/ghidra -maxdepth 1 -type d -name 'ghidra_*' | head -1)
-        GHIDRA_VERSION="12.1"
+        GHIDRA_VERSION="12.1.2"
         echo "Using Ghidra directory: $GHIDRA_DIR"
 
         # Install Framework JARs
@@ -103,12 +103,18 @@ jobs:
 
     - name: Run offline Java tests
       run: |
-        # Annotation-scanner and endpoints.json parity tests.
-        # No Ghidra server needed — pure reflection + static catalog checks.
-        # Integration tests (GhidraMCPPluginTest, EndpointRegistrationTest,
-        # AppTest, ServiceUtilsAddressTest) require a running Ghidra instance
-        # and are deliberately excluded from this run.
-        mvn -q test -Dtest='com.xebyte.offline.*Test'
+        # Annotation-scanner, endpoints.json parity, and mock-based unit tests
+        # (e.g. ServiceUtilsAddressTest) — pure reflection / static checks, no Ghidra
+        # server. The true integration tests (GhidraMCPPluginTest,
+        # EndpointRegistrationTest, AppTest) require a running Ghidra instance and are
+        # excluded from this run.
+        #
+        # com.xebyte.core is included too: those are Mockito/ProgramBuilder tests
+        # that need no server either, and they cover the no-return + flow-repair
+        # behavior (#384/#385). Matching only com.xebyte.offline meant they never
+        # ran in CI at all. The one ProgramBuilder suite self-skips via assumeTrue
+        # when GHIDRA_INSTALL_DIR is unset, which is the case here.
+        mvn -q test -Pcoverage-gate -Dtest='com.xebyte.offline.*Test,com.xebyte.core.*Test'
 
     - name: Verify build artifacts
       run: |
@@ -118,10 +124,31 @@ jobs:
 
     - name: Upload test results
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
       with:
         name: java-test-results
         path: target/surefire-reports/
+
+    - name: Upload JaCoCo coverage report
+      # Offline-tier Java coverage. The -Pcoverage-gate profile on the test step
+      # above enforces the ratchet (pom.xml); this artifact is for inspecting
+      # where the gaps are — open target/site/jacoco/index.html.
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      with:
+        name: jacoco-coverage-report
+        path: target/site/jacoco/
+        if-no-files-found: warn
+
+    # Absorbs the former build.yml: publish the packaged extension zip so the build
+    # artifact stays available without a second workflow re-downloading Ghidra + rebuilding.
+    - name: Upload build artifact
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      with:
+        name: GhidraMCP-artifact
+        path: target/GhidraMCP-*.zip
+        if-no-files-found: warn
 
   python-tests:
     name: Python Tests (pytest)
@@ -131,65 +158,104 @@ jobs:
         python-version: [ '3.10', '3.11', '3.12', '3.13' ]
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
-    - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+    - name: Install uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
       with:
-        python-version: ${{ matrix.python-version }}
-        cache: 'pip'
+        enable-cache: true
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -q -r requirements-test.txt 2>/dev/null || echo "requirements-test.txt not found"
-        pip install -q -r requirements.txt 2>/dev/null || echo "requirements.txt not found"
+    - name: Set up Python ${{ matrix.python-version }}
+      run: uv python install ${{ matrix.python-version }}
 
     - name: Run Python unit tests
       run: |
-        # Run only unit tests (integration tests require a running MCP server)
-        # Includes: tool function tests, endpoint catalog consistency, response schema validation
-        pytest tests/unit/ -v --no-cov --tb=short
+        # Run only unit tests (integration tests require a running MCP server).
+        # uv installs the bridge package (editable) + test group from the lock.
+        # Coverage sources (bridge_mcp_ghidra, tools) come from the addopts in
+        # pyproject.toml. The fail-under floor is a RATCHET: it sits a few
+        # points below the measured baseline (63.6% on 2026-08-11, measured
+        # after the debugger package moved to d2-game-exe and left the
+        # denominator) to absorb platform/version skew — raise it as coverage
+        # improves, never lower it.
+        uv run --python ${{ matrix.python-version }} --group test \
+          pytest tests/unit/ -v --tb=short --cov-fail-under=58
 
     - name: Upload coverage
       if: ${{ always() && hashFiles('coverage.xml', 'tests/coverage.xml') != '' }}
-      uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe  # v5
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v5
       with:
         files: ./coverage.xml,./tests/coverage.xml
         flags: unittests
         fail_ci_if_error: false
 
-  code-quality:
-    name: Code Quality Checks
-    runs-on: ubuntu-latest
+  python-tests-windows:
+    # The bridge has real platform forks (no AF_UNIX in Windows CPython, the
+    # drive-letter socket sweep, debugger proxy gating). The ubuntu matrix job
+    # only ever executes the POSIX half — this leg executes the Windows half
+    # so both sides of every `os.name == "nt"` branch run on each PR.
+    name: Python Tests (pytest, Windows)
+    runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+      with:
+        enable-cache: true
+
+    - name: Set up JDK 21
+      # A unit test shells out to `gradlew deploy --dry-run`, which needs a Java
+      # 21 toolchain; windows-latest doesn't provide one Gradle can auto-detect
+      # (the ubuntu runner ships JAVA_HOME_21 by default, Windows does not).
+      uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95  # v5.6.0
+      with:
+        java-version: '21'
+        distribution: 'temurin'
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
-      with:
-        python-version: '3.10'
+      run: uv python install 3.12
 
-    - name: Install quality tools
+    - name: Run Python unit tests
+      # No coverage floor here — Windows skips a handful of POSIX-only tests,
+      # so the ubuntu job owns the ratchet; this leg gates on pass/fail only.
       run: |
-        pip install -q pylint flake8 black isort 2>/dev/null || true
+        uv run --python 3.12 --group test pytest tests/unit/ -v --no-cov --tb=short
 
-    - name: Run flake8
-      run: flake8 bridge_mcp_ghidra.py --max-line-length=120 --ignore=E501,W503 || true
-
-    - name: Check formatting with black
-      run: black --check bridge_mcp_ghidra.py 2>/dev/null || echo "black check skipped"
-
-  markdown-lint:
-    name: Documentation Quality
+  code-quality:
+    # ADVISORY / non-blocking: every step below ends in `|| true` (or an echo
+    # fallback), so this job surfaces lint/format drift without ever failing CI.
+    # It is intentionally NOT a gate — `build-status` does not depend on it. To make
+    # it gating, drop the `|| true` once the tree is verified flake8/black-clean.
+    name: Code Quality (advisory, non-blocking)
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+      with:
+        enable-cache: true
+
+    - name: Run flake8
+      run: uvx flake8 python/bridge_mcp_ghidra/ --max-line-length=120 --ignore=E501,W503 || true
+
+    - name: Check formatting with black
+      run: uvx black --check python/bridge_mcp_ghidra/ 2>/dev/null || echo "black check skipped"
+
+  markdown-lint:
+    # ADVISORY / non-blocking: continue-on-error means findings never fail CI, and
+    # build-status does not depend on this job. Informational doc-lint only.
+    name: Documentation Quality (advisory, non-blocking)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Lint markdown
-      uses: DavidAnson/markdownlint-cli2-action@05f32210e84442804257b2a6f20b273450ec8265  # v19
+      uses: DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe  # v24.1.0
       with:
         globs: '**/*.md'
         config: '.markdownlintrc'
@@ -200,7 +266,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
     - name: Run Pester suite
       shell: powershell
@@ -208,7 +274,7 @@ jobs:
 
     - name: Upload Pester results
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
       with:
         name: pester-results
         path: tests/pester/pester-results.xml
@@ -216,13 +282,13 @@ jobs:
   build-status:
     name: Build Status
     runs-on: ubuntu-latest
-    needs: [ java-build, python-tests, pester-tests ]
+    needs: [ java-build, python-tests, python-tests-windows, pester-tests ]
     if: always()
 
     steps:
     - name: Report Status
       run: |
-        if [ "${{ needs.java-build.result }}" = "success" ] && [ "${{ needs.python-tests.result }}" = "success" ] && [ "${{ needs.pester-tests.result }}" = "success" ]; then
+        if [ "${{ needs.java-build.result }}" = "success" ] && [ "${{ needs.python-tests.result }}" = "success" ] && [ "${{ needs.python-tests-windows.result }}" = "success" ] && [ "${{ needs.pester-tests.result }}" = "success" ]; then
           echo "✅ All tests passed"
           exit 0
         else

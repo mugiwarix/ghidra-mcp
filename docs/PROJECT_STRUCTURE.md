@@ -11,18 +11,18 @@ ghidra-mcp/
 ├── CHANGELOG.md                 # Version history
 ├── CONTRIBUTING.md              # Contributor workflow
 ├── AGENTS.md / CLAUDE.md        # AI operator guidance
-├── bridge_mcp_ghidra.py         # Python MCP bridge
+├── python/bridge_mcp_ghidra/    # Python MCP bridge package (ghidra-mcp-bridge wheel)
+├── pyproject.toml               # uv project: wheel build + PEP 735 dependency groups
+├── uv.lock                      # Pinned dependency lockfile (uv)
 ├── pom.xml                      # Canonical Maven build
 ├── build.gradle                 # Secondary/manual Gradle path
-├── requirements*.txt            # Python dependencies
 ├── docs/                        # Maintained documentation
 ├── src/                         # Java plugin/headless server source
 ├── tests/                       # Python tests
-├── debugger/                    # Standalone debugger bridge package
 ├── tools/                       # Python utilities and setup helpers
 ├── ghidra_scripts/              # Scripts that run inside Ghidra
 ├── docker/                      # Container assets
-├── d2-analysis/                 # Diablo II workflow material
+├── d2-analysis/                 # Diablo II workflow material (GITIGNORED, not part of the repo)
 ├── dll_exports/                 # Export lists and reference data
 └── examples/                    # Examples and sample inputs
 ```
@@ -54,14 +54,19 @@ ghidra-mcp/
 - Scripts intended to run inside Ghidra's Script Manager
 - Distinct from the Python MCP bridge and external repo tooling
 
-### `debugger/`
+### `debugger/` — moved out 2026-08-11
 
-- Standalone Python debugger server used by the bridge when debugger support is enabled
+- The standalone Python debugger server now lives in `d2-game-exe`; its
+  `d2/conventions.py` made it game-side
+- The bridge keeps 22 proxy tools that forward to `GHIDRA_DEBUGGER_URL`, so
+  debugger support is still reachable — it is just no longer hosted here
 
-### `d2-analysis/`
+### `d2-analysis/` — local only, never tracked
 
 - Diablo II-specific notes, examples, outputs, and workflow material
-- Not part of the core build/deploy path
+- **Gitignored** (14,768 files on disk, 0 tracked). It is not part of this
+  repo and not part of the build/deploy path; it is scratch material that
+  happens to live in the working directory. Nothing here should depend on it.
 
 ## Supported Operator Workflow
 
@@ -83,7 +88,7 @@ workflows.
 | Task | Location |
 |------|----------|
 | Install and deploy | `python -m tools.setup ...` in the repo root |
-| Run the MCP bridge | `bridge_mcp_ghidra.py` |
+| Run the MCP bridge | `uv run bridge-mcp-ghidra` (or `python -m bridge_mcp_ghidra`) |
 | Read release notes | `docs/releases/` |
 | Read prompt docs | `docs/prompts/` |
 | Run Python tests | `tests/` |

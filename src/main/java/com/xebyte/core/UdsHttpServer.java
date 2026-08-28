@@ -69,6 +69,18 @@ public class UdsHttpServer {
         serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
         serverChannel.bind(UnixDomainSocketAddress.of(socketPath));
 
+        // Lock the socket file to owner-only. With a permissive umask
+        // (e.g. 002) the bound socket would otherwise be group-writable,
+        // letting any group member connect directly. No-op on non-POSIX.
+        if (socketPath.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            try {
+                Files.setPosixFilePermissions(socketPath,
+                    java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+            } catch (IOException e) {
+                // Best-effort; the dir is already 0700 via ServerManager.
+            }
+        }
+
         executor = Executors.newCachedThreadPool(r -> {
             Thread t = new Thread(r, "GhidraMCP-UDS-Worker");
             t.setDaemon(true);
@@ -170,6 +182,10 @@ public class UdsHttpServer {
 
             byte[] body = new byte[0];
             if (contentLength > 0) {
+                if (contentLength > SecurityConfig.MAX_REQUEST_BODY_BYTES) {
+                    sendError(out, 413, "Request body exceeds the maximum allowed size");
+                    return;
+                }
                 body = in.readNBytes(contentLength);
             }
 
@@ -197,6 +213,23 @@ public class UdsHttpServer {
             if (handler == null) {
                 sendError(out, 404, "No handler for " + path);
                 return;
+            }
+
+            // Enforce bearer auth uniformly across every UDS context (the TCP
+            // path does this in GhidraMCPPlugin.safeHandler). The socket is
+            // already same-user by 0700/0600 perms, but honoring the token here
+            // keeps the documented "every HTTP request must carry the token"
+            // contract true on both transports. No cross-origin/Host guard is
+            // needed: a browser cannot open a Unix domain socket, so the
+            // CSRF / DNS-rebinding vector does not exist here. Health endpoints
+            // stay exempt so liveness probes work token-less.
+            SecurityConfig sec = SecurityConfig.getInstance();
+            if (sec.isAuthEnabled() && !isAuthExemptPath(path)) {
+                String authHeader = headers.getFirst("Authorization");
+                if (!sec.matchesBearerAuth(authHeader)) {
+                    sendUnauthorized(out);
+                    return;
+                }
             }
 
             ByteArrayInputStream bodyStream = new ByteArrayInputStream(body);
@@ -233,6 +266,31 @@ public class UdsHttpServer {
             prev = c;
         }
         return sb.length() > 0 ? sb.toString() : null;
+    }
+
+    /**
+     * Health-style paths that skip the bearer-auth check, mirroring
+     * {@code isAuthExempt} on the TCP servers. Exact match only — a
+     * {@code startsWith} would let {@code /mcp/health/../delete_file} inherit
+     * the exemption.
+     */
+    private static boolean isAuthExemptPath(String path) {
+        return "/mcp/health".equals(path)
+                || "/health".equals(path)
+                || "/check_connection".equals(path);
+    }
+
+    private void sendUnauthorized(OutputStream out) throws IOException {
+        byte[] bodyBytes = "{\"error\": \"Unauthorized\"}".getBytes(StandardCharsets.UTF_8);
+        String response = "HTTP/1.1 401 Unauthorized\r\n" +
+                "Content-Type: application/json\r\n" +
+                "WWW-Authenticate: Bearer\r\n" +
+                "Content-Length: " + bodyBytes.length + "\r\n" +
+                "Connection: close\r\n" +
+                "\r\n";
+        out.write(response.getBytes(StandardCharsets.US_ASCII));
+        out.write(bodyBytes);
+        out.flush();
     }
 
     private void sendError(OutputStream out, int code, String message) throws IOException {

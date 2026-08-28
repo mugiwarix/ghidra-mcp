@@ -42,7 +42,7 @@ import ghidra.app.cmd.disassemble.DisassembleCommand;
  */
 public class HeadlessEndpointHandler {
 
-    private static final String VERSION = "5.12.0-headless";
+    private static final String VERSION = "7.0.0-headless";
     private final ProgramProvider programProvider;
     private final ThreadingStrategy threadingStrategy;
     private final TaskMonitor monitor;
@@ -278,7 +278,7 @@ public class HeadlessEndpointHandler {
     // ==========================================================================
 
     public String renameFunction(String oldName, String newName, String programName) {
-        return functionService.renameFunction(oldName, newName, programName).toJson();
+        return functionService.renameFunctionByAddress(oldName, newName, programName).toJson();
     }
 
     public String renameFunctionByAddress(String addressStr, String newName, String programName) {
@@ -316,11 +316,11 @@ public class HeadlessEndpointHandler {
     // ==========================================================================
 
     public String setDecompilerComment(String addressStr, String comment, String programName) {
-        return commentService.setDecompilerComment(addressStr, comment, programName).toJson();
+        return commentService.setComment(addressStr, comment, "pre", programName).toJson();
     }
 
     public String setDisassemblyComment(String addressStr, String comment, String programName) {
-        return commentService.setDisassemblyComment(addressStr, comment, programName).toJson();
+        return commentService.setComment(addressStr, comment, "eol", programName).toJson();
     }
 
     // ==========================================================================
@@ -571,7 +571,7 @@ public class HeadlessEndpointHandler {
      * Get all variables (parameters and locals) for a function.
      */
     public String getFunctionVariables(String functionName, String programName) {
-        return functionService.getFunctionVariables(functionName, null, programName, null, null).toJson();
+        return functionService.getFunctionVariables(functionName, null, programName, 200, null).toJson();
     }
 
     /**
@@ -804,20 +804,6 @@ public class HeadlessEndpointHandler {
         } catch (Exception e) {
             return "{\"error\": \"" + escapeJson(e.getMessage()) + "\"}";
         }
-    }
-
-    /**
-     * Get a function's plate (header) comment.
-     */
-    public String getPlateComment(String address, String programName) {
-        return commentService.getPlateComment(address, programName).toJson();
-    }
-
-    /**
-     * Set a function's plate (header) comment.
-     */
-    public String setPlateComment(String functionAddress, String comment, String programName) {
-        return commentService.setPlateComment(functionAddress, comment, programName).toJson();
     }
 
     // ==========================================================================
@@ -1383,7 +1369,7 @@ public class HeadlessEndpointHandler {
      * Validate if a data type exists
      */
     public String validateDataTypeExists(String typeName, String programName) {
-        return dataTypeService.validateDataTypeExists(typeName, programName).toJson();
+        return dataTypeService.validateDataType("", typeName, programName).toJson();
     }
 
     /**
@@ -1840,10 +1826,6 @@ public class HeadlessEndpointHandler {
         return "{\"success\": true, \"message\": \"Server shutting down\"}";
     }
 
-    public String convertNumber(String value, int size) {
-        return com.xebyte.core.ServiceUtils.convertNumber(value, size);
-    }
-
     public String readMemory(String addressStr, int length, String programName) {
         return programScriptService.readMemory(addressStr, length, programName).toJson();
     }
@@ -2093,7 +2075,7 @@ public class HeadlessEndpointHandler {
                 if (func == null) return "{\"error\": \"No function at address\"}";
                 return "{\"success\": true, \"function\": \"" + escapeJson(func.getName()) + "\"," +
                        "\"message\": \"Batch variable type setting queued\", " +
-                       "\"tip\": \"Use set_local_variable_type for individual variable type changes.\"}";
+                       "\"tip\": \"Use set_variable_type for individual variable type changes.\"}";
             });
         } catch (Exception e) {
             return "{\"error\": \"" + escapeJson(e.getMessage()) + "\"}";
