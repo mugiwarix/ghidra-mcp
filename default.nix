@@ -21,7 +21,7 @@
 let
   pname = "ghidra-mcp";
   extensionName = "GhidraMCP";
-  version = "5.12.0";
+  version = "7.0.0";
 
   meta = {
     description = "Ghidra MCP bridge, GUI extension, and headless server";
@@ -40,11 +40,10 @@ let
       rel == "pom.xml"
       || rel == "settings.gradle"
       || rel == "build.gradle"
-      || rel == "bridge_mcp_ghidra.py"
+      || rel == "python"
       || rel == "src"
-      || rel == "debugger"
-      || lib.hasPrefix "src/" rel
-      || lib.hasPrefix "debugger/" rel;
+      || lib.hasPrefix "python/" rel
+      || lib.hasPrefix "src/" rel;
   };
 
   pythonEnv = python3.withPackages (ps: [
@@ -133,9 +132,11 @@ let
     installPhase = ''
       runHook preInstall
 
-      install -Dm644 bridge_mcp_ghidra.py "$out/share/${pname}/bridge_mcp_ghidra.py"
+      mkdir -p "$out/lib/${pname}"
+      cp -r python/bridge_mcp_ghidra "$out/lib/${pname}/"
       makeWrapper ${pythonEnv}/bin/python "$out/bin/bridge_mcp_ghidra" \
-        --add-flags "$out/share/${pname}/bridge_mcp_ghidra.py"
+        --prefix PYTHONPATH : "$out/lib/${pname}" \
+        --add-flags "-m bridge_mcp_ghidra"
       runHook postInstall
     '';
 
